@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { recomputeRollups } from "../src/db/rollups";
+import { MERGE_COMMIT_EXCLUSION, recomputeRollups } from "../src/db/rollups";
 import { isoWeek } from "../src/util/isoweek";
 
 async function seed(): Promise<void> {
@@ -19,6 +19,14 @@ async function seed(): Promise<void> {
 }
 
 describe("recomputeRollups", () => {
+  it("serves the merge-commit lookup from idx_events_merge_commit", async () => {
+    const plan = await env.DB.prepare(
+      `EXPLAIN QUERY PLAN SELECT 1 FROM activity_events e WHERE ${MERGE_COMMIT_EXCLUSION}`,
+    ).all<{ detail: string }>();
+    const details = plan.results.map((r) => r.detail).join("\n");
+    expect(details).toMatch(/USING INDEX idx_events_merge_commit/);
+  });
+
   it("aggregates per day/contributor/type and is safe to re-run", async () => {
     await seed();
     await recomputeRollups(env.DB);

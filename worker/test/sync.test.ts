@@ -168,11 +168,32 @@ describe("full sync against recorded GraphQL pages", () => {
     );
     expect(state.get("*/rotation")).toBe("entropylab");
 
-    // Second run: incremental, and re-upserting the same pages changes nothing.
+    // Second run: incremental, and re-upserting the same pages changes nothing
+    // — and reports nothing, so no rollup rebuild is triggered.
+    expect(first.eventsWritten).toBe(14);
+    await env.DB.prepare("DELETE FROM daily_rollups WHERE type = 'pr'").run();
     const second = await runSync(env, "admin");
     expect(second.kind).toBe("incremental");
     expect(second.done).toBe(true);
+    expect(second.eventsWritten).toBe(0);
     expect(await eventCounts()).toEqual(counts);
+    const prRollups = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM daily_rollups WHERE type = 'pr'",
+    ).first<{ n: number }>();
+    expect(prRollups!.n).toBe(0); // untouched: recomputeRollups did not run
+
+    // A real change to one event counts once and does trigger the rebuild
+    // (a commit, since the commit overlap window always re-fetches it).
+    await env.DB.prepare(
+      "UPDATE activity_events SET payload = '{}' WHERE type = 'commit' AND external_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1'",
+    ).run();
+    const third = await runSync(env, "admin");
+    expect(third.eventsWritten).toBe(1);
+    const rebuilt = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM daily_rollups WHERE type = 'pr'",
+    ).first<{ n: number }>();
+    expect(rebuilt!.n).toBeGreaterThan(0);
+
     const contributorCount = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM contributors",
     ).first<{ n: number }>();
