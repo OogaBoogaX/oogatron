@@ -53,10 +53,9 @@ export function validateStats(json) {
     version === 3
       ? ["commits", "prs", "reviews", "issues", "comments"]
       : ["commits", "prs", "reviews"];
-  // Issues count everywhere but carry no leaderboard of their own.
   const boardKeys =
     version === 3
-      ? ["commits", "prs", "reviews", "comments"]
+      ? ["commits", "prs", "reviews", "comments", "issues"]
       : ["commits", "prs", "reviews"];
 
   const checkTotals = (/** @type {any} */ totals, /** @type {string} */ at) => {
@@ -147,6 +146,9 @@ export function validateStats(json) {
         if (!RECENT_TYPES.has(e?.type)) fail(`${at}.type unknown: ${e?.type}`);
         if (typeof e?.occurred_at !== "string" || !ISO_DATE.test(e.occurred_at))
           fail(`${at}.occurred_at not ISO-8601`);
+        // Optional: pr rows may carry draft (the ticker's DRAFT PR tag).
+        if (e?.draft !== undefined && typeof e.draft !== "boolean")
+          fail(`${at}.draft not a boolean`);
       });
     }
   }

@@ -68,14 +68,20 @@ export function createJumbotronDisplay(options = {}) {
       .slice(0, MAX_REPO_BOARDS);
   }
 
-  /** Rotation, rebuilt per model: recent feed, org totals, then each active
-   * repo's summary followed by its four leaderboards. */
+  const BOARD_TYPES = ["commits", "prs", "reviews", "comments", "issues"];
+
+  /** Rotation, rebuilt per model: recent feed, org totals and org
+   * leaderboards, then each active repo's summary followed by its
+   * leaderboards. */
   function cycle() {
     /** @type {ViewRef[]} */
     const c = [{ name: "recent" }, { name: "totals" }];
+    for (const type of BOARD_TYPES) {
+      c.push({ name: "leaderboard", params: { type } });
+    }
     for (const repo of activeRepos()) {
       c.push({ name: "repo", params: { name: repo.name } });
-      for (const type of ["commits", "prs", "reviews", "comments"]) {
+      for (const type of BOARD_TYPES) {
         c.push({ name: "leaderboard", params: { type, repo: repo.name } });
       }
     }

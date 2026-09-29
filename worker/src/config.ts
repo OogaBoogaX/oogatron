@@ -18,3 +18,6 @@ export const COMMIT_OVERLAP_DAYS = 7;
 
 // A sync_runs row stuck in 'running' longer than this is presumed crashed.
 export const STALE_RUN_MINUTES = 30;
+
+// Finished sync_runs rows older than this are pruned after each successful run.
+export const SYNC_RUNS_RETENTION_DAYS = 7;

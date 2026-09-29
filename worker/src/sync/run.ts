@@ -1,4 +1,4 @@
-import { STALE_RUN_MINUTES } from "../config";
+import { STALE_RUN_MINUTES, SYNC_RUNS_RETENTION_DAYS } from "../config";
 import { loadSyncState, stateKey, syncStateUpsert } from "../db/queries";
 import { recomputeRollups } from "../db/rollups";
 import { bumpCacheGeneration } from "../api/cache";
@@ -175,6 +175,18 @@ export async function runSync(
           budgetSpent: ctx.budget.spent,
         }),
         runId,
+      )
+      .run();
+
+    // The per-minute cron adds 1,440 rows a day; keep a week for debugging.
+    await db
+      .prepare(
+        "DELETE FROM sync_runs WHERE status != 'running' AND started_at < ?",
+      )
+      .bind(
+        new Date(
+          Date.now() - SYNC_RUNS_RETENTION_DAYS * 86400000,
+        ).toISOString(),
       )
       .run();
   } catch (e) {

@@ -193,10 +193,12 @@ const TYPE_COLOR = {
   prs: "prs",
   reviews: "reviews",
   comments: "comments",
+  issues: "issues",
   commit: "commits",
   pr: "prs",
   review: "reviews",
   merge: "accent",
+  issue: "issues",
   comment: "comments",
 };
 
@@ -362,10 +364,13 @@ export function renderRecent(ctx, W, H, model, _params, palette) {
   }
   let y = 15;
   for (const e of model.recent.slice(0, 11)) {
-    const color = palette[TYPE_COLOR[e.type] ?? "accent"];
+    // A draft PR reads muted: it is announced, not landed.
+    const draft = e.type === "pr" && e.draft;
+    const color = draft ? palette.dim : palette[TYPE_COLOR[e.type] ?? "accent"];
+    const label = draft ? "DRAFT PR" : e.type.toUpperCase();
     drawText(ctx, fitText(e.login.toUpperCase(), 60, 1), 4, y, palette.text, 1);
     drawText(ctx, fitText(e.repo.toUpperCase(), 54, 1), 68, y, palette.dim, 1);
-    drawText(ctx, fitText(e.type.toUpperCase(), 42, 1), 126, y, color, 1);
+    drawText(ctx, fitText(label, 42, 1), 126, y, color, 1);
     const age = recentAge(e.occurredAt);
     drawText(ctx, age, W - 4 - measureText(age, 1), y, palette.dim, 1);
     y += 8;

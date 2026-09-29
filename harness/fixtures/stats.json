@@ -432,6 +432,16 @@
         "login": "unclejim7",
         "count": 1
       }
+    ],
+    "issues": [
+      {
+        "login": "rules-without-rulers",
+        "count": 2
+      },
+      {
+        "login": "MrHodlX",
+        "count": 1
+      }
     ]
   },
   "repos": [
@@ -1050,6 +1060,12 @@
             "login": "unclejim7",
             "count": 1
           }
+        ],
+        "issues": [
+          {
+            "login": "rules-without-rulers",
+            "count": 1
+          }
         ]
       }
     },
@@ -1216,6 +1232,16 @@
             "login": "w-s-bitcoin",
             "count": 1
           }
+        ],
+        "issues": [
+          {
+            "login": "MrHodlX",
+            "count": 1
+          },
+          {
+            "login": "rules-without-rulers",
+            "count": 1
+          }
         ]
       }
     },
@@ -1276,7 +1302,8 @@
           }
         ],
         "reviews": [],
-        "comments": []
+        "comments": [],
+        "issues": []
       }
     }
   ],
@@ -1309,7 +1336,8 @@
       "login": "rules-without-rulers",
       "repo": "oogaboogaland",
       "type": "pr",
-      "occurred_at": "2026-09-21T01:27:23Z"
+      "occurred_at": "2026-09-21T01:27:23Z",
+      "draft": true
     },
     {
       "login": "rules-without-rulers",

@@ -39,11 +39,18 @@ export async function persistPage(
       payload: e.payload,
     });
   }
+  const eventsFrom = statements.length;
   statements.push(...eventUpsertStatements(ctx.db, repo, resolved));
+  const eventsTo = statements.length;
   statements.push(syncStateUpsert(ctx.db, repo, source, newState));
   ctx.budget.spend();
-  await ctx.db.batch(statements);
-  ctx.eventsWritten += events.length;
+  const results = await ctx.db.batch(statements);
+  // Count rows actually inserted or changed, not rows sent: overlap windows
+  // re-send unchanged events every run, and counting those would trigger a
+  // full rollup rebuild on every tick.
+  for (let i = eventsFrom; i < eventsTo; i++) {
+    ctx.eventsWritten += results[i].meta.changes ?? 0;
+  }
 }
 
 export function maxIso(a: string | null, b: string | null): string | null {

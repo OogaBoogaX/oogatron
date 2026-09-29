@@ -25,6 +25,7 @@ interface RecentRow {
   repo: string;
   type: string;
   occurred_at: string;
+  payload: string | null;
 }
 
 interface LastActivityRow {
@@ -135,7 +136,7 @@ async function assembleModel(env: Env, url: URL): Promise<StatsModel> {
       // The recent feed reads raw events (rollups are day-grained); the same
       // merge-commit exclusion keeps a merged PR from showing twice.
       env.DB.prepare(
-        `SELECT c.login, e.repo, e.type, e.occurred_at
+        `SELECT c.login, e.repo, e.type, e.occurred_at, e.payload
        FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
        WHERE ${MERGE_COMMIT_EXCLUSION}${botFilter(url)}
        ORDER BY e.occurred_at DESC LIMIT 12`,
@@ -353,6 +354,7 @@ export function shapeV3(model: StatsModel): Record<string, unknown> {
       prs: leaderboardFor(model.contributors, countsOf, (c) => c.prs),
       reviews: leaderboardFor(model.contributors, countsOf, (c) => c.reviews),
       comments: leaderboardFor(model.contributors, countsOf, (c) => c.comments),
+      issues: leaderboardFor(model.contributors, countsOf, (c) => c.issues),
     },
     repos: [...model.perRepo.entries()]
       .map(([name, slice]) => {
@@ -385,6 +387,11 @@ export function shapeV3(model: StatsModel): Record<string, unknown> {
               repoCountsOf,
               (c) => c.comments,
             ),
+            issues: leaderboardFor(
+              model.contributors,
+              repoCountsOf,
+              (c) => c.issues,
+            ),
           },
         };
       })
@@ -394,12 +401,25 @@ export function shapeV3(model: StatsModel): Record<string, unknown> {
             totalV3(a.totals as unknown as Counts) ||
           (a.name < b.name ? -1 : 1),
       ),
-    recent: model.recent.map((r) => ({
-      login: r.login,
-      repo: r.repo,
-      type: recentType(r.type),
-      occurred_at: r.occurred_at,
-    })),
+    recent: model.recent.map((r) => {
+      const row: Record<string, unknown> = {
+        login: r.login,
+        repo: r.repo,
+        type: recentType(r.type),
+        occurred_at: r.occurred_at,
+      };
+      // A draft PR keeps type "pr" (additive contract); the flag lets the
+      // ticker label it DRAFT PR. The payload tracks the PR's current state,
+      // so the tag clears when the PR is marked ready.
+      if (r.type === "pr" && r.payload) {
+        try {
+          if (JSON.parse(r.payload).draft === true) row["draft"] = true;
+        } catch {
+          // tolerate malformed payload rows; the flag just stays off
+        }
+      }
+      return row;
+    }),
     contributors: contributorObjs(model, {
       withWeekly: true,
       withComments: true,

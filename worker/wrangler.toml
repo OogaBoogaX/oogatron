@@ -3,9 +3,9 @@ main = "src/index.ts"
 compatibility_date = "2026-08-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Keep the workers.dev route serving until the site's cutover to the custom
-# domain has deployed; adding routes alone would silently disable it.
-workers_dev = true
+# The custom domain below is the only public route; the default workers.dev
+# route stays off.
+workers_dev = false
 
 [[routes]]
 pattern = "oogatron.ruleswithoutrulers.com"

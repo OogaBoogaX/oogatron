@@ -15,12 +15,13 @@
  *             counts: Counts, weekly: WeekBucket[] }} Contributor
  * @typedef {{ login: string, count: number }} LeaderboardEntry
  * @typedef {{ commits: LeaderboardEntry[], prs: LeaderboardEntry[],
- *             reviews: LeaderboardEntry[], comments: LeaderboardEntry[] }} Boards
+ *             reviews: LeaderboardEntry[], comments: LeaderboardEntry[],
+ *             issues: LeaderboardEntry[] }} Boards
  * @typedef {{ name: string, totals: Counts & { contributors: number },
  *             weekly: WeekBucket[], lastActivityAt: string|null,
  *             leaderboards: Boards,
  *             weeklyTotals: Array<{ week: string, total: number }> }} RepoStats
- * @typedef {{ login: string, repo: string, type: string, occurredAt: string }} RecentEntry
+ * @typedef {{ login: string, repo: string, type: string, occurredAt: string, draft: boolean }} RecentEntry
  *
  * @typedef {{
  *   org: string,
@@ -107,6 +108,7 @@ export function parseStats(json) {
     repo: String(e.repo),
     type: String(e.type),
     occurredAt: String(e.occurred_at),
+    draft: e.draft === true,
   }));
 
   const weeklyMap = new Map();
@@ -119,6 +121,7 @@ export function parseStats(json) {
           commits: 0,
           prs: 0,
           reviews: 0,
+          issues: 0,
           comments: 0,
           total: 0,
         };
@@ -186,6 +189,7 @@ function normalizeBoards(lb) {
     prs: normalizeBoard(lb?.prs),
     reviews: normalizeBoard(lb?.reviews),
     comments: normalizeBoard(lb?.comments),
+    issues: normalizeBoard(lb?.issues),
   };
 }
 

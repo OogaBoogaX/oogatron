@@ -187,14 +187,15 @@ never need lockstep deploys:
   the active-contributor counts.
 - `GET /v2/stats` — **schema_version 3**, the snapshot format and what the
   island consumes: adds `comments` and `issues` to every totals/weekly/counts
-  block and a `comments` leaderboard (issues carry no leaderboard); each
+  block and `comments` and `issues` leaderboards; each
   `repos[]` entry gains `last_activity_at` (the jumbotron hides repos idle
-  >7 days), its own per-repo `leaderboards {commits,prs,reviews,comments}`,
+  >7 days), its own per-repo `leaderboards {commits,prs,reviews,comments,issues}`,
   and `contributors [{login, last_seen_at}]` — per-repo last activity, which
   is what routes each island Ooga to the cave of the repo they contributed
   to; plus `recent` — the newest 12 events org-wide as `[{login, repo,
   type: commit|pr|review|merge|issue|comment, occurred_at}]`,
-  merge-commit-deduped and bot-filtered.
+  merge-commit-deduped and bot-filtered, where a `pr` row carries
+  `draft: true` while that PR is a draft (the ticker's DRAFT PR tag).
 
 Legacy v2 example shape (see the v2 contract test for the source of truth):
 

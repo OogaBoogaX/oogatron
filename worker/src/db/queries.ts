@@ -8,6 +8,11 @@ export interface ResolvedEvent {
   payload: Record<string, unknown>;
 }
 
+// The DO UPDATE is guarded so re-upserting an unchanged event (incremental
+// overlap windows re-fetch the same pages every run) writes nothing and
+// reports zero changes — which is what lets a quiet sync skip the rollup
+// rebuild.
+//
 // Multi-row upserts chunked to stay well under D1's ~100 bound-parameter
 // limit per statement (6 params per row).
 const EVENT_CHUNK = 10;
@@ -41,7 +46,10 @@ export function eventUpsertStatements(
            ON CONFLICT(repo, external_id) DO UPDATE SET
              contributor_id = excluded.contributor_id,
              occurred_at    = excluded.occurred_at,
-             payload        = excluded.payload`,
+             payload        = excluded.payload
+           WHERE contributor_id IS NOT excluded.contributor_id
+              OR occurred_at    IS NOT excluded.occurred_at
+              OR payload        IS NOT excluded.payload`,
         )
         .bind(...params),
     );

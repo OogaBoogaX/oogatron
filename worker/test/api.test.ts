@@ -24,7 +24,7 @@ async function seed(): Promise<void> {
       `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload) VALUES
        ('entropylab', 1, 'commit', 'e1', '2026-01-05T10:00:00Z', NULL),
        ('entropylab', 1, 'commit', 'e2', '2026-01-12T15:00:00Z', NULL),
-       ('bedrock',    1, 'pr',     'e3', '2026-01-06T10:00:00Z', NULL),
+       ('bedrock',    1, 'pr',     'e3', '2026-01-06T10:00:00Z', '{"number":3,"draft":true}'),
        ('entropylab', 2, 'review', 'e5', '2026-01-09T10:00:00Z', NULL),
        ('entropylab', 3, 'commit', 'e6', '2026-01-05T10:00:00Z', NULL),
        ('entropylab', 2, 'merge',  'merge:pr9', '2026-01-12T16:00:00Z', '{"prNumber":9,"mergeCommit":"e2"}'),
@@ -151,17 +151,26 @@ describe("/v2/stats (schema 3)", () => {
     expect(body.repos[1].leaderboards.comments).toEqual([
       { login: "erik", count: 1 },
     ]);
+    // Issues have leaderboards too (org and per repo).
+    expect(body.leaderboards.issues).toEqual([{ login: "alice", count: 1 }]);
+    expect(body.repos[0].leaderboards.issues).toEqual([]);
+    expect(body.repos[1].leaderboards.issues).toEqual([
+      { login: "alice", count: 1 },
+    ]);
 
     // Recent: newest first, bot-filtered, merge commit deduped, comment
-    // surfaces folded to "comment", merges labelled as merges.
-    expect(body.recent.map((r: any) => [r.login, r.repo, r.type])).toEqual([
-      ["alice", "bedrock", "issue"],
-      ["erik", "bedrock", "comment"],
-      ["alice", "entropylab", "comment"],
-      ["erik", "entropylab", "merge"],
-      ["erik", "entropylab", "review"],
-      ["alice", "bedrock", "pr"],
-      ["alice", "entropylab", "commit"],
+    // surfaces folded to "comment", merges labelled as merges, draft PRs
+    // flagged from their payload.
+    expect(
+      body.recent.map((r: any) => [r.login, r.repo, r.type, r.draft]),
+    ).toEqual([
+      ["alice", "bedrock", "issue", undefined],
+      ["erik", "bedrock", "comment", undefined],
+      ["alice", "entropylab", "comment", undefined],
+      ["erik", "entropylab", "merge", undefined],
+      ["erik", "entropylab", "review", undefined],
+      ["alice", "bedrock", "pr", true],
+      ["alice", "entropylab", "commit", undefined],
     ]);
 
     expect(body.contributors[0].counts).toEqual({

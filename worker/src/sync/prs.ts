@@ -18,7 +18,7 @@ const MERGED_BY = `mergedBy { login avatarUrl __typename ... on User { databaseI
 const COMMENTS = `pageInfo { hasNextPage endCursor } nodes { id createdAt ${ACTOR} }`;
 const REVIEW = `id state body submittedAt ${ACTOR} comments(first: 50) { ${COMMENTS} }`;
 const PR = `
-  id number title state createdAt updatedAt mergedAt additions deletions
+  id number title state isDraft createdAt updatedAt mergedAt additions deletions
   ${ACTOR}
   ${MERGED_BY}
   mergeCommit { oid }
@@ -79,6 +79,7 @@ interface GqlPr {
   number: number;
   title: string;
   state: string;
+  isDraft: boolean;
   createdAt: string;
   updatedAt: string;
   mergedAt: string | null;
@@ -187,6 +188,7 @@ export function parsePrNode(pr: GqlPr): {
       number: pr.number,
       title: pr.title,
       state: pr.state,
+      draft: !!pr.isDraft,
       mergedAt: pr.mergedAt,
       additions: pr.additions,
       deletions: pr.deletions,
