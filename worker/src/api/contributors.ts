@@ -1,5 +1,5 @@
 import { botFilter } from "../db/queries";
-import { MERGE_COMMIT_EXCLUSION } from "../db/rollups";
+import { COUNTED } from "../db/rollups";
 import { addToCounts, assembleStats, weeklyFrom, type Counts } from "./stats";
 import { error, json } from "./respond";
 
@@ -61,9 +61,9 @@ export async function handleContributor(
     return error(400, "from/to must be YYYY-MM-DD");
   }
 
-  // Same merge-commit exclusion as the rollup recompute, so this raw-event
+  // Same counted flag as the rollup recompute, so this raw-event
   // path can never disagree with the served rollup numbers.
-  let sql = `SELECT type, occurred_at FROM activity_events e WHERE e.contributor_id = ? AND ${MERGE_COMMIT_EXCLUSION}`;
+  let sql = `SELECT type, occurred_at FROM activity_events e WHERE e.contributor_id = ? AND ${COUNTED}`;
   const params: unknown[] = [row.id];
   if (from) {
     sql += " AND occurred_at >= ?";

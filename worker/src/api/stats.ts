@@ -1,5 +1,5 @@
 import { botFilter } from "../db/queries";
-import { MERGE_COMMIT_EXCLUSION } from "../db/rollups";
+import { COUNTED } from "../db/rollups";
 import { isoWeek } from "../util/isoweek";
 import { json } from "./respond";
 
@@ -138,7 +138,7 @@ async function assembleModel(env: Env, url: URL): Promise<StatsModel> {
       env.DB.prepare(
         `SELECT c.login, e.repo, e.type, e.occurred_at, e.payload
        FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
-       WHERE ${MERGE_COMMIT_EXCLUSION}${botFilter(url)}
+       WHERE ${COUNTED}${botFilter(url)}
        ORDER BY e.occurred_at DESC LIMIT 12`,
       ),
       env.DB.prepare(
@@ -155,7 +155,7 @@ async function assembleModel(env: Env, url: URL): Promise<StatsModel> {
       env.DB.prepare(
         `SELECT e.repo, c.login, MAX(e.occurred_at) AS at
        FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
-       WHERE ${MERGE_COMMIT_EXCLUSION}${botFilter(url)}
+       WHERE ${COUNTED}${botFilter(url)}
        GROUP BY e.repo, e.contributor_id`,
       ),
     ]);
