@@ -2,7 +2,7 @@ import { env, fetchMock } from "cloudflare:test";
 import { beforeAll, afterEach, describe, expect, it } from "vitest";
 import { runSync } from "../src/sync/run";
 import { parseCommitsPage } from "../src/sync/commits";
-import { isCountableReview } from "../src/sync/prs";
+import { isCountableReview, parsePrNode } from "../src/sync/prs";
 import { ContributorResolver } from "../src/sync/identity";
 import commitsPage from "./fixtures/graphql/commits-page.json";
 import prsPage from "./fixtures/graphql/prs-page.json";
@@ -83,7 +83,9 @@ describe("full sync against recorded GraphQL pages", () => {
 
     const counts = await eventCounts();
     expect(counts).toEqual({
-      commit: 3,
+      // a1-a3 from the default branch; PR #1's branch commit is a1 again (one
+      // row by SHA); PR #2's unmerged branch commit b1 counts on its own.
+      commit: 4,
       pr: 2,
       review: 1, // APPROVED only: PENDING and the empty-body container are skipped
       merge: 1, // PR #1, credited to erik who pressed the button
@@ -143,15 +145,15 @@ describe("full sync against recorded GraphQL pages", () => {
 
     // Rollups were recomputed, repo-scoped, and the merge commit (...a3, the
     // PR's mergeCommit) was excluded so the merge is one credit, not two:
-    // 14 raw events minus the excluded commit.
+    // 15 raw events minus the excluded commit.
     const rollups = await env.DB.prepare(
       "SELECT SUM(count) AS n FROM daily_rollups WHERE repo = 'entropylab'",
     ).first<{ n: number }>();
-    expect(rollups!.n).toBe(13);
+    expect(rollups!.n).toBe(14);
     const dedupedCommit = await env.DB.prepare(
       `SELECT SUM(count) AS n FROM daily_rollups WHERE type = 'commit'`,
     ).first<{ n: number }>();
-    expect(dedupedCommit!.n).toBe(2); // a1 + a2; a3 folded into the merge
+    expect(dedupedCommit!.n).toBe(3); // a1 + a2 + b1; a3 folded into the merge
 
     // Sync state promoted to incremental, keyed per repo; the rotation
     // pointer recorded which repo led.
@@ -171,7 +173,7 @@ describe("full sync against recorded GraphQL pages", () => {
 
     // Second run: incremental, and re-upserting the same pages changes nothing
     // — and reports nothing, so no rollup rebuild is triggered.
-    expect(first.eventsWritten).toBe(14);
+    expect(first.eventsWritten).toBe(15);
     await env.DB.prepare("DELETE FROM daily_rollups WHERE type = 'pr'").run();
     const second = await runSync(env, "admin");
     expect(second.kind).toBe("incremental");
@@ -231,7 +233,7 @@ describe("full sync against recorded GraphQL pages", () => {
     // Both repos ingested the recorded pages; uniqueness is repo-scoped, so
     // the same external ids land once per repo.
     const perRepo = {
-      commit: 3,
+      commit: 4,
       pr: 2,
       review: 1,
       merge: 1,
@@ -270,6 +272,46 @@ describe("parseCommitsPage", () => {
     });
     expect(pageInfo.hasNextPage).toBe(false);
     expect(maxSeen).toBe("2026-01-07T12:00:00Z");
+  });
+});
+
+describe("parsePrNode branch commits", () => {
+  const prs = prsPage.data.repository.pullRequests.nodes.filter(
+    (n) => n !== null,
+  ) as any[];
+
+  it("maps branch commits exactly as the default-branch walk does", () => {
+    const fromBranch = parsePrNode(prs[0]).events.filter(
+      (e) => e.type === "commit",
+    );
+    const fromHistory = parseCommitsPage(
+      commitsPage.data as Record<string, unknown>,
+    ).events.find((e) => e.externalId === fromBranch[0].externalId);
+    expect(fromBranch).toHaveLength(1);
+    // Byte-identical payloads, or the guarded upsert would flip the row
+    // between walkers every run.
+    expect(JSON.stringify(fromBranch[0])).toBe(JSON.stringify(fromHistory));
+    expect(fromBranch[0].payload.authoredAt).toBe("2026-01-05T10:00:00Z");
+  });
+
+  it("queues a follow-up when a PR has more commits than one page", () => {
+    const pr = {
+      ...prs[1],
+      commits: {
+        ...prs[1].commits,
+        pageInfo: { hasNextPage: true, endCursor: "commit-cursor-1" },
+      },
+    };
+    expect(parsePrNode(pr).followUps).toEqual([
+      {
+        kind: "pr_overflow",
+        nodeId: "PR_kwDOtest0002",
+        prNumber: 2,
+        reviewCursor: null,
+        commentCursor: null,
+        commitCursor: "commit-cursor-1",
+      },
+    ]);
   });
 });
 

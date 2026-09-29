@@ -125,6 +125,96 @@ describe("recomputeRollups", () => {
   });
 });
 
+describe("patch-identity dedupe", () => {
+  const commit = (
+    oid: string,
+    committed: string,
+    authored: string,
+    headline: string,
+  ) =>
+    env.DB.prepare(
+      `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload)
+       VALUES ('entropylab', 1, 'commit', ?, ?, ?)`,
+    ).bind(
+      oid,
+      committed,
+      JSON.stringify({
+        headline,
+        additions: 1,
+        deletions: 0,
+        authoredAt: authored,
+      }),
+    );
+  const counted = async () =>
+    (
+      await env.DB.prepare(
+        "SELECT external_id FROM activity_events WHERE type = 'commit' AND counted = 1 ORDER BY external_id",
+      ).all<{ external_id: string }>()
+    ).results.map((r) => r.external_id);
+
+  it("counts a rebased or amended patch once, keeping the newest copy", async () => {
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO contributors (id, login, is_bot) VALUES (1, 'alice', 0), (2, 'erik', 0)",
+      ),
+      // PR branch original, then its rebased copy on the default branch.
+      commit(
+        "branch-1",
+        "2026-02-01T10:00:00Z",
+        "2026-02-01T10:00:00Z",
+        "fix: a",
+      ),
+      commit(
+        "rebased-1",
+        "2026-02-03T09:00:00Z",
+        "2026-02-01T10:00:00Z",
+        "fix: a",
+      ),
+      // Same author date, different message: a different patch.
+      commit(
+        "other-1",
+        "2026-02-01T10:00:00Z",
+        "2026-02-01T10:00:00Z",
+        "fix: b",
+      ),
+    ]);
+    await recomputeRollups(env.DB);
+    expect(await counted()).toEqual(["other-1", "rebased-1"]);
+  });
+
+  it("squash: branch commits count, the squash commit folds into the merge", async () => {
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO contributors (id, login, is_bot) VALUES (1, 'alice', 0), (2, 'erik', 0)",
+      ),
+      commit(
+        "branch-1",
+        "2026-02-01T10:00:00Z",
+        "2026-02-01T10:00:00Z",
+        "feat: x",
+      ),
+      commit(
+        "branch-2",
+        "2026-02-01T11:00:00Z",
+        "2026-02-01T11:00:00Z",
+        "fix: y",
+      ),
+      commit(
+        "squash-1",
+        "2026-02-02T09:00:00Z",
+        "2026-02-02T09:00:00Z",
+        "feat: x (#9)",
+      ),
+      env.DB.prepare(
+        `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload)
+         VALUES ('entropylab', 2, 'merge', 'merge:pr9', '2026-02-02T09:00:00Z', '{"prNumber":9,"mergeCommit":"squash-1"}')`,
+      ),
+    ]);
+    await recomputeRollups(env.DB);
+    expect(await counted()).toEqual(["branch-1", "branch-2"]);
+  });
+});
+
 describe("isoWeek", () => {
   it("handles year boundaries per ISO-8601", () => {
     expect(isoWeek("2024-12-30")).toBe("2025-W01"); // Monday of week 1, 2025
