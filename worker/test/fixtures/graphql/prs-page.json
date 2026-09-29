@@ -2,7 +2,10 @@
   "data": {
     "repository": {
       "pullRequests": {
-        "pageInfo": { "hasNextPage": false, "endCursor": "pr-cursor-1" },
+        "pageInfo": {
+          "hasNextPage": false,
+          "endCursor": "pr-cursor-1"
+        },
         "nodes": [
           null,
           {
@@ -32,7 +35,10 @@
               "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3"
             },
             "reviews": {
-              "pageInfo": { "hasNextPage": false, "endCursor": null },
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              },
               "nodes": [
                 {
                   "id": "PRR_pending01",
@@ -46,7 +52,10 @@
                     "databaseId": 3003
                   },
                   "comments": {
-                    "pageInfo": { "hasNextPage": false, "endCursor": null },
+                    "pageInfo": {
+                      "hasNextPage": false,
+                      "endCursor": null
+                    },
                     "nodes": []
                   }
                 },
@@ -62,7 +71,10 @@
                     "databaseId": 3003
                   },
                   "comments": {
-                    "pageInfo": { "hasNextPage": false, "endCursor": null },
+                    "pageInfo": {
+                      "hasNextPage": false,
+                      "endCursor": null
+                    },
                     "nodes": [
                       {
                         "id": "PRRC_line01",
@@ -89,14 +101,20 @@
                     "databaseId": 4004
                   },
                   "comments": {
-                    "pageInfo": { "hasNextPage": false, "endCursor": null },
+                    "pageInfo": {
+                      "hasNextPage": false,
+                      "endCursor": null
+                    },
                     "nodes": []
                   }
                 }
               ]
             },
             "comments": {
-              "pageInfo": { "hasNextPage": false, "endCursor": null },
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              },
               "nodes": [
                 {
                   "id": "IC_ci01",
@@ -106,6 +124,33 @@
                     "avatarUrl": "https://avatars.example.com/gha.png",
                     "__typename": "Bot",
                     "databaseId": 41898282
+                  }
+                }
+              ]
+            },
+            "commits": {
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              },
+              "nodes": [
+                {
+                  "commit": {
+                    "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1",
+                    "committedDate": "2026-01-05T10:00:00Z",
+                    "messageHeadline": "feat: add entropy sampler",
+                    "additions": 120,
+                    "deletions": 8,
+                    "author": {
+                      "name": "Alice A",
+                      "email": "alice@example.com",
+                      "date": "2026-01-05T10:00:00Z",
+                      "user": {
+                        "login": "alice",
+                        "databaseId": 1001,
+                        "avatarUrl": "https://avatars.example.com/alice.png"
+                      }
+                    }
                   }
                 }
               ]
@@ -126,11 +171,17 @@
             "mergedBy": null,
             "mergeCommit": null,
             "reviews": {
-              "pageInfo": { "hasNextPage": false, "endCursor": null },
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              },
               "nodes": []
             },
             "comments": {
-              "pageInfo": { "hasNextPage": false, "endCursor": null },
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              },
               "nodes": [
                 {
                   "id": "IC_alice01",
@@ -143,11 +194,41 @@
                   }
                 }
               ]
+            },
+            "commits": {
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              },
+              "nodes": [
+                {
+                  "commit": {
+                    "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1",
+                    "committedDate": "2026-01-11T08:30:00Z",
+                    "messageHeadline": "wip: island shader",
+                    "additions": 55,
+                    "deletions": 0,
+                    "author": {
+                      "name": "Alice A",
+                      "email": "alice@example.com",
+                      "date": "2026-01-11T08:30:00Z",
+                      "user": {
+                        "login": "alice",
+                        "databaseId": 1001,
+                        "avatarUrl": "https://avatars.example.com/alice.png"
+                      }
+                    }
+                  }
+                }
+              ]
             }
           }
         ]
       }
     },
-    "rateLimit": { "remaining": 4890, "resetAt": "2026-01-15T00:00:00Z" }
+    "rateLimit": {
+      "remaining": 4890,
+      "resetAt": "2026-01-15T00:00:00Z"
+    }
   }
 }

@@ -7,6 +7,12 @@ export type CommitsState =
   | { phase: "backfill"; cursor: string | null; maxSeen: string | null }
   | { phase: "incremental"; since: string };
 
+// Shared with the PR walker (prs.ts), which reads the same fields off each
+// PR's branch commits.
+export const COMMIT_FIELDS = `
+  oid committedDate messageHeadline additions deletions
+  author { name email date user { login databaseId avatarUrl } }`;
+
 const QUERY = `
 query Commits($owner: String!, $name: String!, $branch: String!, $cursor: String, $since: GitTimestamp) {
   repository(owner: $owner, name: $name) {
@@ -14,10 +20,7 @@ query Commits($owner: String!, $name: String!, $branch: String!, $cursor: String
       target { ... on Commit {
         history(first: 100, after: $cursor, since: $since) {
           pageInfo { hasNextPage endCursor }
-          nodes {
-            oid committedDate messageHeadline additions deletions
-            author { name email date user { login databaseId avatarUrl } }
-          }
+          nodes { ${COMMIT_FIELDS} }
         }
       } }
     }
@@ -25,7 +28,7 @@ query Commits($owner: String!, $name: String!, $branch: String!, $cursor: String
   rateLimit { remaining resetAt }
 }`;
 
-interface CommitNode {
+export interface CommitNode {
   oid: string;
   committedDate: string;
   messageHeadline: string;
@@ -62,27 +65,38 @@ export function parseCommitsPage(data: Record<string, unknown>): {
     (n): n is CommitNode => n !== null,
   )) {
     maxSeen = maxIso(maxSeen, node.committedDate);
-    const user = node.author?.user ?? null;
-    events.push({
-      type: "commit",
-      externalId: node.oid,
-      occurredAt: node.committedDate,
-      actor: {
-        githubId: user?.databaseId ?? null,
-        login: user?.login ?? null,
-        displayName: node.author?.name ?? null,
-        avatarUrl: user?.avatarUrl ?? null,
-        typename: user ? "User" : null,
-        email: node.author?.email ?? null,
-      },
-      payload: {
-        headline: node.messageHeadline,
-        additions: node.additions,
-        deletions: node.deletions,
-      },
-    });
+    events.push(commitEvent(node));
   }
   return { events, pageInfo: history.pageInfo as PageInfo, maxSeen };
+}
+
+// The one commit -> event mapping for both walkers. A commit reached from a
+// PR branch and later from the default branch is the same SHA, so the two
+// must produce byte-identical payloads — otherwise the guarded upsert would
+// flip the row on every run and force a rollup rebuild each tick.
+// authoredAt (with the headline) is the patch identity the rollup rebuild
+// uses to count a rebased or amended commit once (see db/rollups.ts).
+export function commitEvent(node: CommitNode): ParsedEvent {
+  const user = node.author?.user ?? null;
+  return {
+    type: "commit",
+    externalId: node.oid,
+    occurredAt: node.committedDate,
+    actor: {
+      githubId: user?.databaseId ?? null,
+      login: user?.login ?? null,
+      displayName: node.author?.name ?? null,
+      avatarUrl: user?.avatarUrl ?? null,
+      typename: user ? "User" : null,
+      email: node.author?.email ?? null,
+    },
+    payload: {
+      headline: node.messageHeadline,
+      additions: node.additions,
+      deletions: node.deletions,
+      authoredAt: node.author?.date ?? null,
+    },
+  };
 }
 
 export async function syncCommits(

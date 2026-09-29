@@ -146,8 +146,14 @@ CREATE TABLE repos (                      -- discovered org repos (discovery cac
 - **Source of truth:** GitHub **GraphQL API**, authenticated with a
   fine-grained PAT held as a Worker secret (`GITHUB_TOKEN`). All tracked repos
   are public; read-only public-repo scope suffices.
-- **What to collect** (commits walk each repo's default branch):
-  - `commit` — branch history. Attribute by the commit author's linked GitHub
+- **What to collect** (commits walk each repo's default branch **and every
+  PR's branch**):
+  - `commit` — default-branch history plus the branch commits of every PR, any
+    state (open, merged, closed), so work counts as soon as it's pushed.
+    Deduped by SHA (a merge-commit merge brings the same SHAs to the default
+    branch) and by patch identity — same repo, author, author date and headline
+    counts once, newest copy kept — which absorbs rebase merges, rebased PR
+    branches and amends. Attribute by the commit author's linked GitHub
     user; when a commit has no linked user, match by author email against known
     contributors, else create an unmatched contributor row keyed by a hash of the
     email (never store the raw email in `login`).
@@ -155,9 +161,11 @@ CREATE TABLE repos (                      -- discovered org repos (discovery cac
   - `review` — review submissions on every PR, by reviewer.
   - `merge` — every merged PR, credited to `mergedBy` (whoever pressed the
     button). The payload records the PR's `mergeCommit` oid; rollups exclude
-    that auto-generated commit so a merge is exactly one credit (for squash
-    merges this shifts the squashed content commit's credit to the merger —
-    an accepted, documented rule).
+    that auto-generated commit so a merge is exactly one credit. For squash
+    merges the squash commit is excluded while the PR's branch commits still
+    credit their authors; for rebase merges the last rebased commit folds into
+    the merge credit (an accepted, documented rule). Both exclusions are
+    materialized into `activity_events.counted` at rollup time.
   - `issue` — opening an issue, credited to its author (the issues walker
     sees every issue node anyway, so the event rides along with its comments).
   - `comment_issue` / `comment_review` / `comment_commit` — the three GitHub
