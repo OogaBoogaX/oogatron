@@ -41,7 +41,14 @@ export class ContributorResolver {
     statements: D1PreparedStatement[],
   ): Promise<string> {
     let a = actor;
-    if (!a.login && !a.githubId && a.email) a = await fromEmail(a);
+    if (!a.login && !a.githubId && a.email) {
+      a = await fromEmail(a);
+      // A noreply address embeds the login as of the commit, which may be
+      // stale; a known id keeps its current login rather than being renamed.
+      if (a.githubId !== null && this.byGithubId.has(a.githubId)) {
+        a = { ...a, login: null };
+      }
+    }
     if (!a.login && !a.githubId) {
       a = { ...a, login: "ghost", displayName: "Deleted user" };
     }

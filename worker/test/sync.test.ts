@@ -4,6 +4,7 @@ import { runSync } from "../src/sync/run";
 import { parseCommitsPage } from "../src/sync/commits";
 import { isCountableReview, parsePrNode } from "../src/sync/prs";
 import { ContributorResolver } from "../src/sync/identity";
+import { actorFrom } from "../src/sync/types";
 import commitsPage from "./fixtures/graphql/commits-page.json";
 import prsPage from "./fixtures/graphql/prs-page.json";
 import issuesPage from "./fixtures/graphql/issues-page.json";
@@ -358,5 +359,68 @@ describe("ContributorResolver", () => {
       first_seen_at: "2026-01-10T10:00:00Z",
       last_seen_at: "2026-02-01T00:00:00Z",
     });
+  });
+});
+
+describe("bot identity", () => {
+  it("resolves a Bot actor and its commits to one row in a single batch", async () => {
+    await env.DB.prepare(
+      "INSERT INTO contributors (github_id, login, is_bot) VALUES (49699333, 'dependabot[bot]', 1)",
+    ).run();
+    const resolver = await ContributorResolver.load(env.DB);
+    const statements: D1PreparedStatement[] = [];
+    const asPrAuthor = await resolver.resolve(
+      env.DB,
+      actorFrom({
+        login: "dependabot",
+        __typename: "Bot",
+        databaseId: 49699333,
+      }),
+      "2026-01-10T10:00:00Z",
+      statements,
+    );
+    const asCommitAuthor = await resolver.resolve(
+      env.DB,
+      {
+        githubId: 49699333,
+        login: "dependabot[bot]",
+        displayName: "dependabot[bot]",
+        avatarUrl: null,
+        typename: "User",
+        email: null,
+      },
+      "2026-01-10T10:05:00Z",
+      statements,
+    );
+    await env.DB.batch(statements);
+    expect(asPrAuthor).toBe("dependabot[bot]");
+    expect(asCommitAuthor).toBe("dependabot[bot]");
+    const rows = await env.DB.prepare(
+      "SELECT login FROM contributors WHERE github_id = 49699333",
+    ).all();
+    expect(rows.results).toEqual([{ login: "dependabot[bot]" }]);
+  });
+
+  it("keeps a known contributor's login when a stale noreply email names them", async () => {
+    await env.DB.prepare(
+      "INSERT INTO contributors (github_id, login) VALUES (2002, 'bob-renamed')",
+    ).run();
+    const resolver = await ContributorResolver.load(env.DB);
+    const statements: D1PreparedStatement[] = [];
+    const login = await resolver.resolve(
+      env.DB,
+      {
+        githubId: null,
+        login: null,
+        displayName: "Bob",
+        avatarUrl: null,
+        typename: null,
+        email: "2002+bob@users.noreply.github.com",
+      },
+      "2026-01-10T10:00:00Z",
+      statements,
+    );
+    await env.DB.batch(statements);
+    expect(login).toBe("bob-renamed");
   });
 });
