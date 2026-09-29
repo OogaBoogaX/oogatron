@@ -1,6 +1,7 @@
 import { OWNER } from "../config";
 import { githubGraphQL } from "./github";
 import { maxIso, persistPage, type SyncContext } from "./context";
+import { COMMIT_FIELDS, commitEvent, type CommitNode } from "./commits";
 import {
   actorFrom,
   type GqlActor,
@@ -17,13 +18,15 @@ const ACTOR = `author { login avatarUrl __typename ... on User { databaseId } ..
 const MERGED_BY = `mergedBy { login avatarUrl __typename ... on User { databaseId } ... on Bot { databaseId } }`;
 const COMMENTS = `pageInfo { hasNextPage endCursor } nodes { id createdAt ${ACTOR} }`;
 const REVIEW = `id state body submittedAt ${ACTOR} comments(first: 50) { ${COMMENTS} }`;
+const COMMITS = `pageInfo { hasNextPage endCursor } nodes { commit { ${COMMIT_FIELDS} } }`;
 const PR = `
   id number title state isDraft createdAt updatedAt mergedAt additions deletions
   ${ACTOR}
   ${MERGED_BY}
   mergeCommit { oid }
   reviews(first: 50) { pageInfo { hasNextPage endCursor } nodes { ${REVIEW} } }
-  comments(first: 50) { ${COMMENTS} }`;
+  comments(first: 50) { ${COMMENTS} }
+  commits(first: 50) { ${COMMITS} }`;
 
 const PAGE_QUERY = `
 query PRs($owner: String!, $name: String!, $cursor: String, $order: IssueOrderField!, $dir: OrderDirection!) {
@@ -37,12 +40,13 @@ query PRs($owner: String!, $name: String!, $cursor: String, $order: IssueOrderFi
 }`;
 
 const PR_OVERFLOW_QUERY = `
-query PrOverflow($id: ID!, $reviewCursor: String, $commentCursor: String) {
+query PrOverflow($id: ID!, $reviewCursor: String, $commentCursor: String, $commitCursor: String) {
   node(id: $id) {
     ... on PullRequest {
       number
       reviews(first: 50, after: $reviewCursor) { pageInfo { hasNextPage endCursor } nodes { ${REVIEW} } }
       comments(first: 50, after: $commentCursor) { ${COMMENTS} }
+      commits(first: 50, after: $commitCursor) { ${COMMITS} }
     }
   }
   rateLimit { remaining resetAt }
@@ -90,6 +94,11 @@ interface GqlPr {
   mergeCommit: { oid: string } | null;
   reviews: { pageInfo: PageInfo; nodes: GqlReview[] };
   comments: { pageInfo: PageInfo; nodes: GqlComment[] };
+  commits: { pageInfo: PageInfo; nodes: Array<GqlPrCommit | null> };
+}
+
+interface GqlPrCommit {
+  commit: CommitNode | null;
 }
 
 export interface FollowUp {
@@ -98,6 +107,7 @@ export interface FollowUp {
   prNumber: number;
   reviewCursor: string | null;
   commentCursor: string | null;
+  commitCursor: string | null;
 }
 
 // GitHub auto-creates an empty-body COMMENTED "container" review for every
@@ -152,6 +162,7 @@ function reviewEvents(
       prNumber,
       reviewCursor: null,
       commentCursor: review.comments.pageInfo.endCursor,
+      commitCursor: null,
     });
   }
 }
@@ -169,6 +180,20 @@ function conversationCommentEvents(
       actor: actorFrom(c.author),
       payload: { issueNumber: prNumber, surface: "pr" },
     });
+  }
+}
+
+// Every PR's branch commits count, whatever the PR's state, so work shows up
+// as soon as it's pushed rather than when it lands. A merge-commit merge
+// brings the same SHAs onto the default branch (one row, via the
+// UNIQUE(repo, external_id) upsert); rebases get new SHAs and are counted
+// once by the patch-identity flag in db/rollups.ts.
+function branchCommitEvents(
+  nodes: Array<GqlPrCommit | null>,
+  out: ParsedEvent[],
+): void {
+  for (const n of nodes) {
+    if (n?.commit) out.push(commitEvent(n.commit));
   }
 }
 
@@ -215,8 +240,13 @@ export function parsePrNode(pr: GqlPr): {
     reviewEvents(review, pr.number, events, followUps);
   }
   conversationCommentEvents(pr.comments.nodes, pr.number, events);
+  branchCommitEvents(pr.commits.nodes, events);
 
-  if (pr.reviews.pageInfo.hasNextPage || pr.comments.pageInfo.hasNextPage) {
+  if (
+    pr.reviews.pageInfo.hasNextPage ||
+    pr.comments.pageInfo.hasNextPage ||
+    pr.commits.pageInfo.hasNextPage
+  ) {
     followUps.push({
       kind: "pr_overflow",
       nodeId: pr.id,
@@ -226,6 +256,9 @@ export function parsePrNode(pr: GqlPr): {
         : null,
       commentCursor: pr.comments.pageInfo.hasNextPage
         ? pr.comments.pageInfo.endCursor
+        : null,
+      commitCursor: pr.commits.pageInfo.hasNextPage
+        ? pr.commits.pageInfo.endCursor
         : null,
     });
   }
@@ -267,6 +300,7 @@ async function drainFollowUps(
           id: f.nodeId,
           reviewCursor: f.reviewCursor,
           commentCursor: f.commentCursor,
+          commitCursor: f.commitCursor,
         },
       );
       const node = (data as any).node as GqlPr | null;
@@ -280,6 +314,7 @@ async function drainFollowUps(
             ...f,
             reviewCursor: node.reviews.pageInfo.endCursor,
             commentCursor: null,
+            commitCursor: null,
           });
         }
       }
@@ -290,6 +325,18 @@ async function drainFollowUps(
             ...f,
             reviewCursor: null,
             commentCursor: node.comments.pageInfo.endCursor,
+            commitCursor: null,
+          });
+        }
+      }
+      if (f.commitCursor !== null) {
+        branchCommitEvents(node.commits.nodes, events);
+        if (node.commits.pageInfo.hasNextPage) {
+          followUps.push({
+            ...f,
+            reviewCursor: null,
+            commentCursor: null,
+            commitCursor: node.commits.pageInfo.endCursor,
           });
         }
       }

@@ -59,9 +59,18 @@ export function actorFrom(a: GqlActor | null | undefined): ActorRef {
       email: null,
     };
   }
+  // GraphQL names a Bot actor "dependabot" but the same account's commits
+  // "dependabot[bot]". Both carry one databaseId, so without a single
+  // canonical form the resolver renames the row back and forth — and a page
+  // holding both forms (a bot's PR plus its branch commits) leaves events
+  // pointing at a login that no longer exists.
+  const login =
+    a.__typename === "Bot" && !a.login.endsWith("[bot]")
+      ? `${a.login}[bot]`
+      : a.login;
   return {
     githubId: a.databaseId ?? null,
-    login: a.login,
+    login,
     displayName: null,
     avatarUrl: a.avatarUrl ?? null,
     typename: a.__typename ?? null,
