@@ -3,6 +3,7 @@ import { beforeAll, afterEach, describe, expect, it } from "vitest";
 import { runSync } from "../src/sync/run";
 import { parseCommitsPage } from "../src/sync/commits";
 import { isCountableReview } from "../src/sync/prs";
+import { ContributorResolver } from "../src/sync/identity";
 import commitsPage from "./fixtures/graphql/commits-page.json";
 import prsPage from "./fixtures/graphql/prs-page.json";
 import issuesPage from "./fixtures/graphql/issues-page.json";
@@ -280,5 +281,40 @@ describe("isCountableReview", () => {
     expect(isCountableReview("COMMENTED", "")).toBe(false);
     expect(isCountableReview("COMMENTED", "  \n")).toBe(false);
     expect(isCountableReview("COMMENTED", "real prose")).toBe(true);
+  });
+});
+
+describe("ContributorResolver", () => {
+  it("writes nothing when re-resolving an unchanged contributor", async () => {
+    const actor = {
+      githubId: 4242,
+      login: "alice",
+      displayName: "Alice",
+      avatarUrl: "https://avatars.example/alice",
+      typename: "User",
+      email: null,
+    };
+    const changes = async (): Promise<number[]> => {
+      const resolver = await ContributorResolver.load(env.DB);
+      const statements: D1PreparedStatement[] = [];
+      await resolver.resolve(env.DB, actor, "2026-01-10T10:00:00Z", statements);
+      const results = await env.DB.batch(statements);
+      return results.map((r) => r.meta.changes ?? 0);
+    };
+    expect(await changes()).toEqual([1]); // rule 2/3: insert
+    expect(await changes()).toEqual([0]); // rule 1: unchanged refresh
+    // A genuinely newer event still moves last_seen_at.
+    const resolver = await ContributorResolver.load(env.DB);
+    const statements: D1PreparedStatement[] = [];
+    await resolver.resolve(env.DB, actor, "2026-02-01T00:00:00Z", statements);
+    const [res] = await env.DB.batch(statements);
+    expect(res.meta.changes).toBe(1);
+    const row = await env.DB.prepare(
+      "SELECT first_seen_at, last_seen_at FROM contributors WHERE login = 'alice'",
+    ).first();
+    expect(row).toEqual({
+      first_seen_at: "2026-01-10T10:00:00Z",
+      last_seen_at: "2026-02-01T00:00:00Z",
+    });
   });
 });

@@ -47,6 +47,9 @@ export class ContributorResolver {
     }
 
     // Rule 1: known github_id — refresh (handles login renames via UPDATE).
+    // Both writes below are guarded like eventUpsertStatements: overlap
+    // windows re-resolve the same actors every run, and an unguarded refresh
+    // rewrote a contributor row for every re-sent event (~1.4M writes/day).
     if (a.githubId !== null && this.byGithubId.has(a.githubId)) {
       const known = this.byGithubId.get(a.githubId)!;
       const login = a.login ?? known.login;
@@ -54,22 +57,18 @@ export class ContributorResolver {
         db
           .prepare(
             `UPDATE contributors SET
-               login = ?, display_name = COALESCE(?, display_name),
-               avatar_url = COALESCE(?, avatar_url),
-               first_seen_at = MIN(COALESCE(first_seen_at, ?), ?),
-               last_seen_at  = MAX(COALESCE(last_seen_at, ?), ?)
-             WHERE github_id = ?`,
+               login = ?1, display_name = COALESCE(?3, display_name),
+               avatar_url = COALESCE(?4, avatar_url),
+               first_seen_at = MIN(COALESCE(first_seen_at, ?2), ?2),
+               last_seen_at  = MAX(COALESCE(last_seen_at, ?2), ?2)
+             WHERE github_id = ?5 AND (
+               login IS NOT ?1
+               OR display_name IS NOT COALESCE(?3, display_name)
+               OR avatar_url   IS NOT COALESCE(?4, avatar_url)
+               OR first_seen_at IS NOT MIN(COALESCE(first_seen_at, ?2), ?2)
+               OR last_seen_at  IS NOT MAX(COALESCE(last_seen_at, ?2), ?2))`,
           )
-          .bind(
-            login,
-            a.displayName,
-            a.avatarUrl,
-            occurredAt,
-            occurredAt,
-            occurredAt,
-            occurredAt,
-            a.githubId,
-          ),
+          .bind(login, occurredAt, a.displayName, a.avatarUrl, a.githubId),
       );
       if (known.login !== login) {
         this.byLogin.delete(known.login);
@@ -96,7 +95,13 @@ export class ContributorResolver {
              avatar_url    = COALESCE(excluded.avatar_url, contributors.avatar_url),
              is_bot        = MAX(excluded.is_bot, contributors.is_bot),
              first_seen_at = MIN(COALESCE(contributors.first_seen_at, excluded.first_seen_at), excluded.first_seen_at),
-             last_seen_at  = MAX(COALESCE(contributors.last_seen_at, excluded.last_seen_at), excluded.last_seen_at)`,
+             last_seen_at  = MAX(COALESCE(contributors.last_seen_at, excluded.last_seen_at), excluded.last_seen_at)
+           WHERE contributors.github_id IS NOT COALESCE(excluded.github_id, contributors.github_id)
+              OR contributors.display_name IS NOT COALESCE(excluded.display_name, contributors.display_name)
+              OR contributors.avatar_url IS NOT COALESCE(excluded.avatar_url, contributors.avatar_url)
+              OR contributors.is_bot IS NOT MAX(excluded.is_bot, contributors.is_bot)
+              OR contributors.first_seen_at IS NOT MIN(COALESCE(contributors.first_seen_at, excluded.first_seen_at), excluded.first_seen_at)
+              OR contributors.last_seen_at IS NOT MAX(COALESCE(contributors.last_seen_at, excluded.last_seen_at), excluded.last_seen_at)`,
         )
         .bind(
           a.githubId,

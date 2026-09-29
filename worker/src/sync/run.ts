@@ -178,10 +178,11 @@ export async function runSync(
       )
       .run();
 
-    // The per-minute cron adds 1,440 rows a day; keep a week for debugging.
+    // The per-minute cron adds 1,440 rows a day; health reads only the newest.
+    // The started_at range is served by idx_sync_runs_started.
     await db
       .prepare(
-        "DELETE FROM sync_runs WHERE status != 'running' AND started_at < ?",
+        "DELETE FROM sync_runs WHERE started_at < ? AND status != 'running'",
       )
       .bind(
         new Date(
