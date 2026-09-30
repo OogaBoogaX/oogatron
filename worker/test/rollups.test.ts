@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { COUNTED, recomputeRollups } from "../src/db/rollups";
+import { recomputeRollups } from "../src/db/rollups";
 import { isoWeek } from "../src/util/isoweek";
 
 async function seed(): Promise<void> {
@@ -19,16 +19,7 @@ async function seed(): Promise<void> {
 }
 
 describe("recomputeRollups", () => {
-  it("serves the recent feed from idx_events_time and prunes sync_runs by index", async () => {
-    const recent = await env.DB.prepare(
-      `EXPLAIN QUERY PLAN SELECT c.login, e.repo, e.type, e.occurred_at, e.payload
-       FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
-       WHERE ${COUNTED} AND c.is_bot = 0
-       ORDER BY e.occurred_at DESC LIMIT 12`,
-    ).all<{ detail: string }>();
-    expect(recent.results.map((r) => r.detail).join("\n")).toMatch(
-      /USING INDEX idx_events_time/,
-    );
+  it("prunes sync_runs by index", async () => {
     const prune = await env.DB.prepare(
       "EXPLAIN QUERY PLAN DELETE FROM sync_runs WHERE started_at < ? AND status != 'running'",
     )

@@ -95,7 +95,8 @@ and carry `meta: { generated_at, repo, schema_version }`.
 
 | Endpoint | Returns |
 | --- | --- |
-| `GET /v1/stats` | The everything-payload: totals, leaderboards, and the complete per-contributor breakdown with weekly buckets (this is also the snapshot format) |
+| `GET /v1/stats` | Legacy schema 2: totals, leaderboards, and the complete per-contributor breakdown with weekly buckets (commits, PRs, reviews only) |
+| `GET /v2/stats` | Schema 3, the snapshot format: everything above plus `issues`/`comments`, per-repo leaderboards and last activity, and `recent` — the newest 12 events per (repo, contributor, type) cell, so the island's client-side filters never run dry |
 | `GET /v1/contributors` | Roster with lifetime counts (no weekly detail) |
 | `GET /v1/contributors/{login}` | One contributor, with `?from=`, `?to=`, `?type=` filters recomputed from raw events |
 | `GET /v1/health` | Last sync run, cursors, and row counts |
@@ -180,6 +181,11 @@ changing it:
 - **Never re-derive dedupe per request.** Filter on `counted` (the `COUNTED`
   constant in `worker/src/db/rollups.ts`). Correlated subqueries in the stats
   path once cost ~570k row reads per cache miss.
+- **The recent feed is one full pass over `activity_events` per cache miss**
+  (a window function keeps the newest 12 per repo/contributor/type cell; no
+  index can serve that partition). It is the same order of work as the two
+  per-repo `GROUP BY` reads beside it, so leave it as one statement rather
+  than one query per cell.
 - **Every upsert is guarded** so an unchanged row writes nothing. The sync
   re-fetches overlap windows every minute; unguarded writes to events or
   contributors turn that into millions of rewrites a day.
