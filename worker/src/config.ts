@@ -28,3 +28,10 @@ export const GITHUB_TIMEOUT_MS = 20_000;
 
 // Finished sync_runs rows older than this are pruned after each successful run.
 export const SYNC_RUNS_RETENTION_DAYS = 1;
+
+// /v2/stats `recent` keeps this many newest events per (repo, contributor,
+// public type) cell. Any client-side filter is a union of cells, so every
+// filtered feed has at least this many rows (or the selection's whole
+// history). 12 is >= the 10 the island shows and equals the old org-wide cap,
+// so the unfiltered feed's first 12 rows are unchanged.
+export const RECENT_DEPTH = 12;

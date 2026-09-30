@@ -200,10 +200,16 @@ never need lockstep deploys:
   >7 days), its own per-repo `leaderboards {commits,prs,reviews,comments,issues}`,
   and `contributors [{login, last_seen_at}]` — per-repo last activity, which
   is what routes each island Ooga to the cave of the repo they contributed
-  to; plus `recent` — the newest 12 events org-wide as `[{login, repo,
-  type: commit|pr|review|merge|issue|comment, occurred_at}]`,
-  merge-commit-deduped and bot-filtered, where a `pr` row carries
-  `draft: true` while that PR is a draft (the ticker's DRAFT PR tag).
+  to; plus `recent` — the newest `RECENT_DEPTH` (12, `worker/src/config.ts`)
+  events **per (repo, contributor, type) cell**, unioned and ordered
+  newest-first, as `[{login, repo, type:
+  commit|pr|review|merge|issue|comment, occurred_at}]`, merge-commit-deduped
+  and bot-filtered. The per-cell depth is what lets the island filter the
+  feed client-side by any combination of repos, contributors and types and
+  still show its 10 newest rows (a selection is a union of cells, and an
+  event among a union's newest N is among its own cell's newest N). A `pr`
+  row carries `draft: true` while that PR is a draft (the ticker's DRAFT PR
+  tag).
 
 Legacy v2 example shape (see the v2 contract test for the source of truth):
 

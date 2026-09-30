@@ -1,3 +1,4 @@
+import { RECENT_DEPTH } from "../config";
 import { botFilter } from "../db/queries";
 import { COUNTED } from "../db/rollups";
 import { isoWeek } from "../util/isoweek";
@@ -134,13 +135,27 @@ async function assembleModel(env: Env, url: URL): Promise<StatsModel> {
        WHERE 1=1${botFilter(url)}`,
       ),
       // The recent feed reads raw events (rollups are day-grained); the same
-      // merge-commit exclusion keeps a merged PR from showing twice.
+      // merge-commit exclusion keeps a merged PR from showing twice. It keeps
+      // the newest RECENT_DEPTH events per (repo, contributor, public type)
+      // cell rather than org-wide, so the island's client-side filters (any
+      // combination of repos, contributors and types) never run dry: a
+      // filtered selection is a union of cells, and an event among the newest
+      // N of a union is among the newest N of its own cell. Comment surfaces
+      // share a cell because shapeV3 folds them into one "comment" type. One
+      // full pass over counted events plus a sort — the same order of work as
+      // the two GROUP BY reads below.
       env.DB.prepare(
-        `SELECT c.login, e.repo, e.type, e.occurred_at, e.payload
-       FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
-       WHERE ${COUNTED}${botFilter(url)}
-       ORDER BY e.occurred_at DESC LIMIT 12`,
-      ),
+        `SELECT login, repo, type, occurred_at, payload FROM (
+           SELECT c.login, e.repo, e.type, e.occurred_at, e.payload, e.id,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY e.repo, e.contributor_id,
+                      CASE WHEN e.type LIKE 'comment_%' THEN 'comment' ELSE e.type END
+                    ORDER BY e.occurred_at DESC, e.id DESC) AS rn
+           FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
+           WHERE ${COUNTED}${botFilter(url)})
+         WHERE rn <= ?
+         ORDER BY occurred_at DESC, id DESC`,
+      ).bind(RECENT_DEPTH),
       env.DB.prepare(
         `SELECT e.repo, MAX(e.occurred_at) AS at
        FROM activity_events e JOIN contributors c ON c.id = e.contributor_id

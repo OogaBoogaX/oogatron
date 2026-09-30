@@ -1,5 +1,6 @@
 import { env, fetchMock, SELF } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
+import { RECENT_DEPTH } from "../src/config";
 import { recomputeRollups } from "../src/db/rollups";
 import commitsPage from "./fixtures/graphql/commits-page.json";
 import prsPage from "./fixtures/graphql/prs-page.json";
@@ -34,6 +35,53 @@ async function seed(): Promise<void> {
     ),
   ]);
   await recomputeRollups(env.DB);
+}
+
+// Deep seed for the per-cell recent feed: one hot cell (alice's entropylab
+// commits), two comment surfaces sharing a cell, a busy bot whose rows are the
+// newest of all, and three older singles in cells of their own.
+async function seedDeep(): Promise<void> {
+  const hour = (day: string, h: number) =>
+    `2026-${day}T${String(h).padStart(2, "0")}:00:00Z`;
+  const commits = Array.from(
+    { length: RECENT_DEPTH + 3 },
+    (_, i) =>
+      `('entropylab', 1, 'commit', 'c${i}', '${hour("02-01", i + 1)}', NULL)`,
+  );
+  const comments = Array.from(
+    { length: 16 },
+    (_, i) =>
+      `('bedrock', 2, '${i % 2 ? "comment_review" : "comment_issue"}', 'k${i}', '${hour("01-20", i)}', NULL)`,
+  );
+  const botCommits = Array.from(
+    { length: RECENT_DEPTH + 1 },
+    (_, i) =>
+      `('entropylab', 3, 'commit', 'b${i}', '${hour("02-02", i + 1)}', NULL)`,
+  );
+  const singles = [
+    "('entropylab', 2, 'review', 'r1', '2026-01-10T10:00:00Z', NULL)",
+    `('bedrock',    2, 'pr',     'p1', '2026-01-11T10:00:00Z', '{"number":1,"draft":true}')`,
+    "('bedrock',    1, 'issue',  'i1', '2026-01-12T10:00:00Z', NULL)",
+  ];
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO contributors (id, github_id, login, is_bot) VALUES
+       (1, 1001, 'alice', 0), (2, 4004, 'erik', 0), (3, 5005, 'robo[bot]', 1)`,
+    ),
+    env.DB.prepare(
+      `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload) VALUES
+       ${[...commits, ...comments, ...botCommits, ...singles].join(",\n")}`,
+    ),
+  ]);
+  await recomputeRollups(env.DB);
+}
+
+interface RecentOut {
+  login: string;
+  repo: string;
+  type: string;
+  occurred_at: string;
+  draft?: boolean;
 }
 
 describe("/v1/stats (schema 2, comments invisible)", () => {
@@ -172,6 +220,7 @@ describe("/v2/stats (schema 3)", () => {
       ["alice", "bedrock", "pr", true],
       ["alice", "entropylab", "commit", undefined],
     ]);
+    expect(body.recent).toHaveLength(7);
 
     expect(body.contributors[0].counts).toEqual({
       commits: 1,
@@ -181,6 +230,55 @@ describe("/v2/stats (schema 3)", () => {
       comments: 1,
     });
     expect(body.contributors[0].login).toBe("alice");
+  });
+
+  it("keeps RECENT_DEPTH events per (repo, contributor, type) cell so filtered feeds never run dry", async () => {
+    await seedDeep();
+    const res = await SELF.fetch(`${BASE}/v2/stats`);
+    const rows = ((await res.json()) as { recent: RecentOut[] }).recent;
+
+    // The hot cell is cut to RECENT_DEPTH, newest kept; the bot's newer
+    // commits are a different cell and excluded by default.
+    const commits = rows.filter((r) => r.type === "commit");
+    expect(commits).toHaveLength(RECENT_DEPTH);
+    expect(commits.every((r) => r.login === "alice")).toBe(true);
+    expect(commits[0].occurred_at).toBe("2026-02-01T15:00:00Z");
+    expect(commits[RECENT_DEPTH - 1].occurred_at).toBe("2026-02-01T04:00:00Z");
+
+    // Older singles in other cells all survive, so a repo, contributor or
+    // type filter on any of them has something to show.
+    expect(
+      rows.map((r) => [r.login, r.repo, r.type, r.draft]).slice(-3),
+    ).toEqual([
+      ["alice", "bedrock", "issue", undefined],
+      ["erik", "bedrock", "pr", true],
+      ["erik", "entropylab", "review", undefined],
+    ]);
+
+    // Newest first throughout, and nothing else slipped in.
+    const times = rows.map((r) => r.occurred_at);
+    expect(times).toEqual([...times].sort().reverse());
+    expect(rows).toHaveLength(RECENT_DEPTH * 2 + 3);
+  });
+
+  it("folds the comment surfaces into one recent cell", async () => {
+    await seedDeep();
+    const res = await SELF.fetch(`${BASE}/v2/stats`);
+    const rows = ((await res.json()) as { recent: RecentOut[] }).recent;
+    const comments = rows.filter((r) => r.type === "comment");
+    // 8 comment_issue + 8 comment_review seeded; served as one capped cell.
+    expect(comments).toHaveLength(RECENT_DEPTH);
+    expect(comments[0].occurred_at).toBe("2026-01-20T15:00:00Z");
+    expect(comments[RECENT_DEPTH - 1].occurred_at).toBe("2026-01-20T04:00:00Z");
+  });
+
+  it("keeps bot cells out of recent unless ?include_bots=1", async () => {
+    await seedDeep();
+    const res = await SELF.fetch(`${BASE}/v2/stats?include_bots=1`);
+    const rows = ((await res.json()) as { recent: RecentOut[] }).recent;
+    const bot = rows.filter((r) => r.login === "robo[bot]");
+    expect(bot).toHaveLength(RECENT_DEPTH); // its own cell, capped the same way
+    expect(rows[0].login).toBe("robo[bot]"); // newest overall
   });
 
   it("includes bots with ?include_bots=1", async () => {
