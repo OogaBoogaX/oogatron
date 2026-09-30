@@ -1,3 +1,4 @@
+import { GITHUB_TIMEOUT_MS } from "../config";
 import { Budget } from "./budget";
 
 export class RateLimited extends Error {
@@ -34,6 +35,7 @@ export async function githubGraphQL(
         "user-agent": "oogatron",
       },
       body: JSON.stringify({ query, variables }),
+      signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
     });
 
     if (res.status === 403 || res.status === 429) {

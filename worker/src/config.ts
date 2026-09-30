@@ -17,7 +17,14 @@ export const REPO_DISCOVERY_TTL_MINUTES = 60;
 export const COMMIT_OVERLAP_DAYS = 7;
 
 // A sync_runs row stuck in 'running' longer than this is presumed crashed.
-export const STALE_RUN_MINUTES = 30;
+// Runs are budget-bounded and finish in under a minute of wall time; a run
+// the runtime kills mid-flight (e.g. clientDisconnected) never marks itself
+// finished, and every cron skips until this expires — so keep it short.
+export const STALE_RUN_MINUTES = 5;
+
+// Per-request cap on GitHub GraphQL calls. A hung request would otherwise
+// hold the run open until the runtime kills it, leaving a stale row.
+export const GITHUB_TIMEOUT_MS = 20_000;
 
 // Finished sync_runs rows older than this are pruned after each successful run.
 export const SYNC_RUNS_RETENTION_DAYS = 1;
