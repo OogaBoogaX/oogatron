@@ -424,3 +424,29 @@ describe("bot identity", () => {
     expect(login).toBe("bob-renamed");
   });
 });
+
+describe("stale-run guard", () => {
+  it("skips while a fresh run is active and reclaims a stale one", async () => {
+    const minutesAgo = (m: number) =>
+      new Date(Date.now() - m * 60000).toISOString();
+    const row = await env.DB.prepare(
+      "INSERT INTO sync_runs (kind, started_at, status) VALUES ('incremental', ?, 'running') RETURNING id",
+    )
+      .bind(minutesAgo(1))
+      .first<{ id: number }>();
+    expect((await runSync(env, "cron")).skipped).toBe(true);
+
+    await env.DB.prepare("UPDATE sync_runs SET started_at = ? WHERE id = ?")
+      .bind(minutesAgo(6), row!.id)
+      .run();
+    const result = await runSync(env, "cron");
+    expect(result.skipped).toBe(false);
+    const stale = await env.DB.prepare(
+      "SELECT status, detail FROM sync_runs WHERE id = ?",
+    )
+      .bind(row!.id)
+      .first<{ status: string; detail: string }>();
+    expect(stale!.status).toBe("error");
+    expect(stale!.detail).toContain("[marked stale]");
+  });
+});
