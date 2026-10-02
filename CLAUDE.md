@@ -17,7 +17,7 @@ Read it fully before writing code.
 
 | Decision | Choice |
 | --- | --- |
-| Repo home | `rules-without-rulers/oogatron` (may transfer to OogaBoogaX later; nothing may depend on the org name) |
+| Repo home | `OogaBoogaX/oogatron` (transferred from `rules-without-rulers/oogatron`; nothing may depend on the org name) |
 | Default branch | `rock` (org convention — entropylab and oogaboogaland both use it) |
 | Hosting | Cloudflare Workers + D1 + KV, in the owner's personal Cloudflare account. No Vercel. |
 | Ingestion | **Cron polling only.** No webhooks — they require admin on entropylab, which is out of scope. Design so a webhook route can be added later without schema or contract changes. |
@@ -138,8 +138,8 @@ CREATE TABLE repos (                      -- discovered org repos (discovery cac
   in backfill (also drivable manually via an authenticated
   `POST /admin/backfill`).
 - **Repos:** discovered from the **OogaBoogaX org** (public, non-fork,
-  non-archived; `EXCLUDED_REPOS` in config opts specific repos out). Discovery
-  is TTL-gated (~hourly, `REPO_DISCOVERY_TTL_MINUTES`) and cached in the
+  non-archived; `EXCLUDED_REPOS` in config opts specific repos out — oogatron
+  itself is excluded). Discovery is TTL-gated (~hourly, `REPO_DISCOVERY_TTL_MINUTES`) and cached in the
   `repos` table with each repo's default branch. Sync loops repos in
   round-robin order resumed from the `'*'/'rotation'` pointer, so one repo's
   backfill can't starve the others.
@@ -311,7 +311,7 @@ never fetches — data is always pushed in via `update()`.
    put the returned IDs in `worker/wrangler.toml` (IDs are not secrets; commit them).
 2. Cloudflare API token: "Edit Cloudflare Workers" template + D1 edit, scoped to
    the account. Note the Account ID from the dashboard.
-3. GitHub repo secrets on `rules-without-rulers/oogatron`:
+3. GitHub repo secrets on `OogaBoogaX/oogatron`:
    `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`.
 4. Worker secrets (never in the repo): `wrangler secret put GITHUB_TOKEN`
    (fine-grained PAT, public-repo read-only), `wrangler secret put ADMIN_TOKEN`.
@@ -328,7 +328,7 @@ Default `*.workers.dev` URL is fine; custom domain later if desired.
 - `deploy.yml` — on push to `rock`: apply D1 migrations, `wrangler deploy` via
   the official `cloudflare/wrangler-action`, using the two repo secrets.
 - Keep deploys in Actions (not Cloudflare's git integration) so the setup
-  survives a future transfer to the OogaBoogaX org with only a secrets re-check.
+  survived the transfer to the OogaBoogaX org with only a secrets re-check.
 
 ## Testing
 

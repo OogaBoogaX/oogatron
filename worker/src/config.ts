@@ -5,7 +5,8 @@ export const SCHEMA_VERSION_V3 = 3;
 
 // Repos are discovered from the org (public, non-fork, non-archived); list
 // short names here to keep specific repos off the jumbotron anyway.
-export const EXCLUDED_REPOS: string[] = [];
+// oogatron lives in the org too, but the scoreboard does not score itself.
+export const EXCLUDED_REPOS: string[] = ["oogatron"];
 
 // Org repo discovery re-runs when the repos table is older than this; between
 // refreshes each sync run reads the cached table only.
