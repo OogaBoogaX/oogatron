@@ -56,7 +56,7 @@ The oogaboogaland rebuild should never need a secret or a personal worker URL.
 Point it at the committed snapshot in the **oogatron repo** instead:
 
 ```
-https://raw.githubusercontent.com/rules-without-rulers/oogatron/rock/harness/fixtures/stats.json
+https://raw.githubusercontent.com/OogaBoogaX/oogatron/rock/harness/fixtures/stats.json
 ```
 
 Prerequisite in oogatron (one small workflow, not part of this repo yet): a
