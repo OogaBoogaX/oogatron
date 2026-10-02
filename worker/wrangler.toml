@@ -1,15 +1,11 @@
 name = "oogatron"
+account_id = "ec2385bbc9929ecbe6a24b00452b3cac"
 main = "src/index.ts"
 compatibility_date = "2026-08-01"
 compatibility_flags = ["nodejs_compat"]
 
-# The custom domain below is the only public route; the default workers.dev
-# route stays off.
-workers_dev = false
-
-[[routes]]
-pattern = "oogatron.ruleswithoutrulers.com"
-custom_domain = true
+# Served at https://oogatron.oogaboogax.workers.dev.
+workers_dev = true
 
 [observability]
 enabled = true
@@ -20,9 +16,9 @@ crons = ["* * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "oogatron"
-database_id = "a7240dfc-d6e1-44e0-a302-0837f3ecf9ab"
+database_id = "c0b4f5f5-92eb-4a7e-982f-a72b44934640"
 migrations_dir = "migrations"
 
 [[kv_namespaces]]
 binding = "CACHE"
-id = "9befda5d95c94c00aa0f56d0250202d7"
+id = "5956cb001dac4b47964cef01a307b583"
