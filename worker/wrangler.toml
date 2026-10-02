@@ -1,10 +1,10 @@
 name = "oogatron"
-account_id = "ec2385bbc9929ecbe6a24b00452b3cac"
+account_id = "1e5c1e8f7c343bf6cabced151b1ae2c6"
 main = "src/index.ts"
 compatibility_date = "2026-08-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Served at https://oogatron.oogaboogax.workers.dev.
+# Served at https://oogatron.wickedsmartbitcoin.workers.dev.
 workers_dev = true
 
 [observability]
@@ -16,9 +16,9 @@ crons = ["* * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "oogatron"
-database_id = "c0b4f5f5-92eb-4a7e-982f-a72b44934640"
+database_id = "a4f9fdda-0cff-40fe-94bf-8c54d77dfbee"
 migrations_dir = "migrations"
 
 [[kv_namespaces]]
 binding = "CACHE"
-id = "5956cb001dac4b47964cef01a307b583"
+id = "6718e4dc7215495ca70e2f18e51ee74d"
