@@ -1,4 +1,5 @@
 import type { EventType } from "../sync/types";
+import { canonicalRepoName } from "../config";
 
 export interface ResolvedEvent {
   login: string;
@@ -22,6 +23,7 @@ export function eventUpsertStatements(
   repo: string,
   events: ResolvedEvent[],
 ): D1PreparedStatement[] {
+  repo = canonicalRepoName(repo);
   const statements: D1PreparedStatement[] = [];
   for (let i = 0; i < events.length; i += EVENT_CHUNK) {
     const chunk = events.slice(i, i + EVENT_CHUNK);
@@ -68,11 +70,16 @@ export function syncStateUpsert(
       `INSERT INTO sync_state (repo, source, cursor, updated_at) VALUES (?, ?, ?, ?)
        ON CONFLICT(repo, source) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at`,
     )
-    .bind(repo, source, JSON.stringify(cursor), new Date().toISOString());
+    .bind(
+      canonicalRepoName(repo),
+      source,
+      JSON.stringify(cursor),
+      new Date().toISOString(),
+    );
 }
 
 export function stateKey(repo: string, source: string): string {
-  return `${repo}/${source}`;
+  return `${canonicalRepoName(repo)}/${source}`;
 }
 
 export async function loadSyncState(

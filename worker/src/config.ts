@@ -1,4 +1,13 @@
 export const OWNER = "OogaBoogaX";
+
+// Historical names of the same org repository. Keep the storage key stable
+// through a rename; BananaPayServer is a separate repository, not an alias.
+export function canonicalRepoName(name: string): string {
+  return /^lightning[-_]?(?:factory|foundry)$/i.test(name)
+    ? "lightningfoundry"
+    : name;
+}
+
 // Default meta version for v1-route responses; /v2/stats serves schema 3.
 export const SCHEMA_VERSION = 2;
 export const SCHEMA_VERSION_V3 = 3;
