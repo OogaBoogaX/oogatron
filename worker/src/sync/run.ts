@@ -84,6 +84,34 @@ export async function runSync(
     };
   }
 
+  // 0009 can run before an old Worker invocation finishes. It may restore a
+  // canonical cursor or have committed pages before an alias guard aborts
+  // its next page. Finalize only after that run is gone; keep the marker
+  // through every failure so cursor reset, rollups and cache can retry.
+  const cleanup = await db
+    .prepare(
+      "SELECT 1 FROM sync_state WHERE repo = '*' AND source = 'foundry_cleanup'",
+    )
+    .first();
+  if (cleanup) {
+    await db
+      .prepare(
+        `DELETE FROM sync_state WHERE repo = 'lightningfoundry'
+         OR (repo = '*' AND source = 'rotation'
+           AND lower(json_extract(cursor, '$')) IN (
+             'lightningfactory', 'lightning-factory', 'lightning_factory',
+             'lightningfoundry', 'lightning-foundry', 'lightning_foundry'))`,
+      )
+      .run();
+    await recomputeRollups(db);
+    await bumpCacheGeneration(env);
+    await db
+      .prepare(
+        "DELETE FROM sync_state WHERE repo = '*' AND source = 'foundry_cleanup'",
+      )
+      .run();
+  }
+
   const ctx: SyncContext = {
     env,
     db,

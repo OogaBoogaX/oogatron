@@ -1,4 +1,9 @@
-import { EXCLUDED_REPOS, OWNER, REPO_DISCOVERY_TTL_MINUTES } from "../config";
+import {
+  canonicalRepoName,
+  EXCLUDED_REPOS,
+  OWNER,
+  REPO_DISCOVERY_TTL_MINUTES,
+} from "../config";
 import { githubGraphQL } from "./github";
 import type { SyncContext } from "./context";
 import type { RepoRef } from "./types";
@@ -51,13 +56,17 @@ export async function activeRepos(ctx: SyncContext): Promise<RepoRef[]> {
         (n): n is RepoNode => n !== null,
       )) {
         const branch = node.defaultBranchRef?.name ?? null;
-        seen.set(node.name, {
+        const name = canonicalRepoName(node.name);
+        // Prefer the current name's branch/status if a listing contains
+        // both it and a historical alias, regardless of listing order.
+        if (seen.has(name) && node.name.toLowerCase() !== name) continue;
+        seen.set(name, {
           branch: branch ?? "",
           // An empty repo (no default branch) is remembered but inactive.
           active:
             !node.isArchived &&
             branch !== null &&
-            !EXCLUDED_REPOS.includes(node.name),
+            !EXCLUDED_REPOS.includes(name),
         });
       }
       const pageInfo = conn.pageInfo as PageInfo;

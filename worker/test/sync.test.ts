@@ -64,6 +64,65 @@ async function syncStateMap(): Promise<Map<string, unknown>> {
 }
 
 describe("full sync against recorded GraphQL pages", () => {
+  it("discovers renamed Foundry once and keeps BananaPayServer independent", async () => {
+    orgReposResponse = {
+      data: {
+        organization: {
+          repositories: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [
+              {
+                name: "LightningFactory",
+                isArchived: true,
+                defaultBranchRef: { name: "old" },
+              },
+              {
+                name: "lightningfoundry",
+                isArchived: false,
+                defaultBranchRef: { name: "rock" },
+              },
+              {
+                name: "LIGHTNING-FOUNDRY",
+                isArchived: true,
+                defaultBranchRef: { name: "also-old" },
+              },
+              {
+                name: "bananapayserver",
+                isArchived: false,
+                defaultBranchRef: { name: "main" },
+              },
+            ],
+          },
+        },
+        rateLimit: { remaining: 4999, resetAt: "2026-01-07T13:00:00Z" },
+      },
+    };
+    const result = await runSync(env, "admin");
+    expect(result.done).toBe(true);
+    const rows = await env.DB.prepare(
+      "SELECT name, default_branch, is_active FROM repos ORDER BY name",
+    ).all();
+    expect(rows.results).toEqual([
+      { name: "bananapayserver", default_branch: "main", is_active: 1 },
+      { name: "lightningfoundry", default_branch: "rock", is_active: 1 },
+    ]);
+    // The same recorded GitHub IDs count once in each independent repo;
+    // historical names neither add a third copy nor suppress BananaPay.
+    expect(await eventCounts("lightningfoundry")).toEqual(
+      await eventCounts("bananapayserver"),
+    );
+    expect((await eventCounts("lightningfoundry")).commit).toBe(4);
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT DISTINCT repo FROM activity_events ORDER BY repo",
+        ).all()
+      ).results,
+    ).toEqual([{ repo: "bananapayserver" }, { repo: "lightningfoundry" }]);
+    const second = await runSync(env, "admin");
+    expect(second.eventsWritten).toBe(0);
+  });
+
   it("discovers repos, ingests every source, resolves identities, and is idempotent", async () => {
     orgReposResponse = orgRepos;
 
@@ -426,6 +485,59 @@ describe("bot identity", () => {
 });
 
 describe("stale-run guard", () => {
+  it("finalizes Foundry cleanup after an old run, even when the next sync is quiet", async () => {
+    const now = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO sync_runs (kind, started_at, status) VALUES ('incremental', ?, 'running')",
+      ).bind(now),
+      // No active repos or GitHub pages in this run: only the pending
+      // migration can repair rollups left behind by the old partial run.
+      env.DB.prepare(
+        "INSERT INTO repos VALUES ('bananapayserver', 'main', 0, ?, ?)",
+      ).bind(now, now),
+      env.DB.prepare(
+        "INSERT INTO contributors (id, login) VALUES (1, 'alice')",
+      ),
+      env.DB.prepare(
+        `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at)
+         VALUES ('bananapayserver', 1, 'commit', 'earlier-page', ?)`,
+      ).bind(now),
+      // The old invocation held these in memory before migration and wrote
+      // them afterward. It can use the canonical name and still be stale.
+      env.DB.prepare(
+        `INSERT INTO sync_state VALUES
+         ('lightningfoundry', 'commits', '{"phase":"incremental"}', ?),
+         ('*', 'rotation', '"LightningFactory"', ?)`,
+      ).bind(now, now),
+    ]);
+    const pending = () =>
+      env.DB.prepare(
+        "SELECT * FROM sync_state WHERE source = 'foundry_cleanup'",
+      ).first();
+    expect(await pending()).not.toBeNull();
+    expect((await runSync(env, "cron")).skipped).toBe(true);
+    expect(await pending()).not.toBeNull();
+    expect(
+      (await env.DB.prepare("SELECT * FROM daily_rollups").all()).results,
+    ).toHaveLength(0);
+
+    await env.DB.prepare("UPDATE sync_runs SET status = 'error'").run();
+    await env.CACHE.put("cache:gen", "before-cleanup");
+    const result = await runSync(env, "cron");
+    expect(result.done).toBe(true);
+    expect(result.eventsWritten).toBe(0);
+    expect(await pending()).toBeNull();
+    expect(
+      (await env.DB.prepare("SELECT * FROM sync_state").all()).results,
+    ).toHaveLength(0);
+    expect(
+      (await env.DB.prepare("SELECT repo, count FROM daily_rollups").all())
+        .results,
+    ).toEqual([{ repo: "bananapayserver", count: 1 }]);
+    expect(await env.CACHE.get("cache:gen")).not.toBe("before-cleanup");
+  });
+
   it("skips while a fresh run is active and reclaims a stale one", async () => {
     const minutesAgo = (m: number) =>
       new Date(Date.now() - m * 60000).toISOString();

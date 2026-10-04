@@ -218,6 +218,30 @@ npx wrangler d1 insights oogatron --timePeriod 1h --sort-by reads   # or writes
 
 ### Re-walking history
 
+`0009_canonical_lightningfoundry.sql` consolidates the historical
+`lightningfactory`, `lightning-foundry`, and separator/case variants into
+`lightningfoundry`. Only repeated `external_id` values within that rename
+family are removed; distinct events remain, even at the same timestamp.
+On a duplicate, the canonical row's payload wins, or the last ingested alias
+copy if no canonical row exists. Existing merge/patch counting rules are then
+re-applied and the repository's rollups rebuilt immediately. BananaPayServer
+remains a separate repository.
+
+The migration consolidates discovery metadata and clears only Foundry's
+opaque sync cursors for a canonical re-walk. Discovery and persistence now
+normalize the historical names. Database guards reject retired-name writes
+from an old worker between migration and deployment: an overlapping old run
+can fail with `retired repository alias: use lightningfoundry`, rolling back
+its whole page and cursor advance. Its replacement retries canonically; no
+event page is skipped. The migration also leaves a one-time
+`*/foundry_cleanup` marker: after the old run finishes, the new worker resets
+Foundry's cursors again, rebuilds all rollups (including any earlier pages
+the old run committed), and invalidates the response cache before removing
+the marker. A failure keeps it pending for a safe retry. Check health after
+deployment for recurring failures, and confirm the marker is gone before
+baking a new snapshot. Cached pre-migration responses can remain for up to
+60 seconds before that finalization; a fresh query string bypasses them.
+
 A migration that deletes `sync_state` rows (as `0005` and `0008` do) makes
 those repos re-read their full history. A run that started before the
 migration can write its old cursors back afterward, silently skipping the
