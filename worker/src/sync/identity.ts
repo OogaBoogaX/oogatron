@@ -1,3 +1,4 @@
+import { attributedActor } from "./attributions";
 import { isBot } from "./bots";
 import type { ActorRef } from "./types";
 
@@ -49,6 +50,7 @@ export class ContributorResolver {
         a = { ...a, login: null };
       }
     }
+    a = attributedActor(a);
     if (!a.login && !a.githubId) {
       a = { ...a, login: "ghost", displayName: "Deleted user" };
     }

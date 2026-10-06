@@ -112,6 +112,23 @@ export async function runSync(
       .run();
   }
 
+  // Finish the event-attribution repair after any old invocation has exited.
+  // Keep the marker until both rollups and the public cache reflect the repair.
+  const attributionCleanup = await db
+    .prepare(
+      "SELECT 1 FROM sync_state WHERE repo = '*' AND source = 'attribution_cleanup'",
+    )
+    .first();
+  if (attributionCleanup) {
+    await recomputeRollups(db);
+    await bumpCacheGeneration(env);
+    await db
+      .prepare(
+        "DELETE FROM sync_state WHERE repo = '*' AND source = 'attribution_cleanup'",
+      )
+      .run();
+  }
+
   const ctx: SyncContext = {
     env,
     db,
