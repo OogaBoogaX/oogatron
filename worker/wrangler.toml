@@ -11,7 +11,7 @@ workers_dev = true
 enabled = true
 
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/1 * * * *"]
 
 [[d1_databases]]
 binding = "DB"
