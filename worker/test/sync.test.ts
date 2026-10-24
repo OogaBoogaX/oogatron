@@ -156,6 +156,17 @@ describe("full sync against recorded GraphQL pages", () => {
       comment_issue: 4, // PR conversation x2 + issue comments x2
       comment_commit: 1,
     });
+    const storedCommits = await env.DB.prepare(
+      "SELECT payload FROM activity_events WHERE type = 'commit'",
+    ).all<{ payload: string }>();
+    // Neither walker fetches line counts. Every SHA keeps the same compact
+    // payload, with the author date/headline still available for patch dedupe.
+    for (const row of storedCommits.results) {
+      expect(Object.keys(JSON.parse(row.payload)).sort()).toEqual([
+        "authoredAt",
+        "headline",
+      ]);
+    }
     const mergeRow = await env.DB.prepare(
       "SELECT external_id, payload FROM activity_events WHERE type = 'merge'",
     ).first<{ external_id: string; payload: string }>();
@@ -172,6 +183,10 @@ describe("full sync against recorded GraphQL pages", () => {
       ["PR_kwDOtest0001", false],
       ["PR_kwDOtest0002", true],
     ]);
+    expect(JSON.parse(prRows.results[0].payload)).toMatchObject({
+      additions: 120,
+      deletions: 8,
+    });
     const repoScan = await env.DB.prepare(
       "SELECT DISTINCT repo FROM activity_events",
     ).all<{ repo: string }>();
@@ -247,13 +262,16 @@ describe("full sync against recorded GraphQL pages", () => {
     ).first<{ n: number }>();
     expect(prRollups!.n).toBe(0); // untouched: recomputeRollups did not run
 
-    // A real change to one event counts once and does trigger the rebuild
-    // (a commit, since the commit overlap window always re-fetches it).
+    // An old stored commit with line counts is normalized once, without
+    // changing its credit or flipping between the history and PR walkers.
     await env.DB.prepare(
-      "UPDATE activity_events SET payload = '{}' WHERE type = 'commit' AND external_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1'",
+      `UPDATE activity_events SET payload = json_set(payload, '$.additions', 120, '$.deletions', 8)
+       WHERE type = 'commit' AND external_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1'`,
     ).run();
     const third = await runSync(env, "admin");
     expect(third.eventsWritten).toBe(1);
+    expect(await eventCounts()).toEqual(counts);
+    expect((await runSync(env, "admin")).eventsWritten).toBe(0);
     const rebuilt = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM daily_rollups WHERE type = 'pr'",
     ).first<{ n: number }>();
@@ -326,7 +344,10 @@ describe("parseCommitsPage", () => {
       type: "commit",
       externalId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1",
       actor: { githubId: 1001, login: "alice" },
-      payload: { headline: "feat: add entropy sampler", additions: 120 },
+      payload: {
+        headline: "feat: add entropy sampler",
+        authoredAt: "2026-01-05T10:00:00Z",
+      },
     });
     expect(events[1].actor).toMatchObject({
       login: null,

@@ -139,8 +139,6 @@
                     "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1",
                     "committedDate": "2026-01-05T10:00:00Z",
                     "messageHeadline": "feat: add entropy sampler",
-                    "additions": 120,
-                    "deletions": 8,
                     "author": {
                       "name": "Alice A",
                       "email": "alice@example.com",
@@ -206,8 +204,6 @@
                     "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1",
                     "committedDate": "2026-01-11T08:30:00Z",
                     "messageHeadline": "wip: island shader",
-                    "additions": 55,
-                    "deletions": 0,
                     "author": {
                       "name": "Alice A",
                       "email": "alice@example.com",
