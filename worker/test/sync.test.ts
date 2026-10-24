@@ -1,6 +1,7 @@
 import { env, fetchMock } from "cloudflare:test";
-import { beforeAll, afterEach, describe, expect, it } from "vitest";
+import { beforeAll, afterEach, describe, expect, it, vi } from "vitest";
 import { runSync } from "../src/sync/run";
+import { handleHealth } from "../src/api/health";
 import { parseCommitsPage } from "../src/sync/commits";
 import { isCountableReview, parsePrNode } from "../src/sync/prs";
 import { ContributorResolver } from "../src/sync/identity";
@@ -39,6 +40,7 @@ beforeAll(() => {
 });
 afterEach(() => {
   fetchMock.assertNoPendingInterceptors();
+  vi.restoreAllMocks();
 });
 
 async function eventCounts(repo?: string): Promise<Record<string, number>> {
@@ -485,6 +487,58 @@ describe("bot identity", () => {
 });
 
 describe("stale-run guard", () => {
+  it("records initialization failures and recovers on the next attempt", async () => {
+    const now = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO sync_runs (kind, started_at, finished_at, status, detail)
+         VALUES ('incremental', ?, ?, 'ok', '{"trigger":"cron"}')`,
+      ).bind(now, now),
+      env.DB.prepare(
+        `INSERT INTO sync_state VALUES
+         ('entropylab', 'commits', '{"phase":"incremental","since":"2026-01-07T12:00:00Z"}', ?)`,
+      ).bind(now),
+    ]);
+    orgReposResponse = {
+      errors: [{ type: "FORBIDDEN", message: "discovery unavailable" }],
+    };
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    await expect(runSync(env, "cron")).rejects.toThrow("discovery unavailable");
+    const health = (await (await handleHealth(env)).json()) as any;
+    expect(health.last_run).toMatchObject({
+      status: "error",
+      detail: { trigger: "cron", phase: "initializing", eventsWritten: 0 },
+    });
+    expect(health.last_run.detail.error).toContain("discovery unavailable");
+    expect(health.last_run.finished_at).not.toBeNull();
+    expect(health.freshness).toMatchObject({ healthy: false, stale: false });
+    expect(health.sync_state["entropylab/commits"].cursor).toEqual({
+      phase: "incremental",
+      since: "2026-01-07T12:00:00Z",
+    });
+    expect(logged).toHaveBeenCalledOnce();
+
+    orgReposResponse = orgRepos;
+    const next = await runSync(env, "cron");
+    expect(next.skipped).toBe(false);
+    expect(next.done).toBe(true);
+    const recovered = (await (await handleHealth(env)).json()) as any;
+    expect(recovered.last_run.status).toBe("ok");
+    expect(recovered.freshness.healthy).toBe(true);
+  });
+
+  it("atomically admits only one of simultaneous triggers", async () => {
+    orgReposResponse = orgRepos;
+    const results = await Promise.all([
+      runSync(env, "cron"),
+      runSync(env, "admin"),
+    ]);
+    expect(results.filter((r) => r.skipped)).toHaveLength(1);
+    expect(results.filter((r) => r.done)).toHaveLength(1);
+    const rows = await env.DB.prepare("SELECT status FROM sync_runs").all();
+    expect(rows.results).toEqual([{ status: "ok" }]);
+  });
+
   it("finalizes Foundry cleanup after an old run, even when the next sync is quiet", async () => {
     const now = new Date().toISOString();
     await env.DB.batch([
