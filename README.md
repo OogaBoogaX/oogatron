@@ -204,8 +204,12 @@ npx wrangler d1 insights oogatron --timePeriod 1h --sort-by reads   # or writes
 ### Sync health
 
 `GET /v1/health` shows the last run, each repo/source cursor and its phase
-(`backfill` or `incremental`), and row counts. Every run is recorded in
-`sync_runs` (kept for one day).
+(`backfill` or `incremental`), and row counts. `freshness` reports the latest
+attempt, latest successful finish and whether ingestion is healthy. Its age
+measures sync time, not the response's `generated_at` or an event's date:
+a quiet repository can be freshly checked without having new contributions.
+Each cursor's `age_seconds` measures its last persisted check/page. Attempts
+are recorded in `sync_runs` before initialization (kept for one day).
 
 - **A killed run** (e.g. the runtime disconnects the cron invocation) never
   marks itself finished, and later runs skip while it looks active. The
@@ -213,8 +217,15 @@ npx wrangler d1 insights oogatron --timePeriod 1h --sort-by reads   # or writes
   resumes on its own. GitHub requests time out after 20 seconds so a hung
   request can't cause this.
 - **A run erroring every minute** (`status: error` with the same message) means
-  one page can't be persisted; the cursor stays put and nothing is lost. Fix
-  the cause and deploy — the next run resumes from that page.
+  initialization or a sync page is failing; its phase and error identify where.
+  Cursors retain completed pages. Fix the cause and deploy — the next run
+  resumes from the stored cursors.
+- **No new attempts** can mean missing cron delivery or a failure before D1
+  can record the attempt. Check Cloudflare Cron Events and the
+  `cron_sync_failed` log, which includes the expression and scheduled time.
+  Handler failures propagate to Cloudflare rather than appearing as successful
+  invocations. Manage the every-minute `*/1 * * * *` trigger in
+  `worker/wrangler.toml`; schedule changes can take up to 15 minutes to propagate.
 
 ### Re-walking history
 

@@ -75,16 +75,21 @@ export default {
     return error(404, "not found");
   },
 
-  async scheduled(_controller, env, ctx): Promise<void> {
-    ctx.waitUntil(
-      runSync(env, "cron").catch((e) => {
-        console.error(
-          JSON.stringify({
-            event: "cron_sync_failed",
-            message: e instanceof Error ? e.message : String(e),
-          }),
-        );
-      }),
-    );
+  async scheduled(controller, env): Promise<void> {
+    try {
+      await runSync(env, "cron");
+    } catch (e) {
+      console.error(
+        JSON.stringify({
+          event: "cron_sync_failed",
+          cron: controller.cron,
+          scheduledTime: controller.scheduledTime,
+          message: e instanceof Error ? e.message : String(e),
+        }),
+      );
+      // Let Cloudflare record the failed invocation, including failures before
+      // D1 can store an attempt. Swallowing it reports a successful cron event.
+      throw e;
+    }
   },
 } satisfies ExportedHandler<Env>;
