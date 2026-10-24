@@ -71,10 +71,18 @@ export async function runSync(
     )
     .bind(now, staleBefore)
     .run();
-  const active = await db
-    .prepare("SELECT id FROM sync_runs WHERE status = 'running' LIMIT 1")
-    .first();
-  if (active) {
+  // Claim and record the attempt in one statement, before any initialization
+  // can fail. Separate checking and inserting lets simultaneous triggers race.
+  const run = await db
+    .prepare(
+      `INSERT INTO sync_runs (kind, started_at, status, detail)
+       SELECT 'incremental', ?, 'running', ?
+       WHERE NOT EXISTS (SELECT 1 FROM sync_runs WHERE status = 'running')
+       RETURNING id`,
+    )
+    .bind(now, JSON.stringify({ trigger, phase: "initializing" }))
+    .first<{ id: number }>();
+  if (!run) {
     return {
       skipped: true,
       done: false,
@@ -84,84 +92,87 @@ export async function runSync(
     };
   }
 
-  // 0009 can run before an old Worker invocation finishes. It may restore a
-  // canonical cursor or have committed pages before an alias guard aborts
-  // its next page. Finalize only after that run is gone; keep the marker
-  // through every failure so cursor reset, rollups and cache can retry.
-  const cleanup = await db
-    .prepare(
-      "SELECT 1 FROM sync_state WHERE repo = '*' AND source = 'foundry_cleanup'",
-    )
-    .first();
-  if (cleanup) {
-    await db
+  const runId = run.id;
+  const budget = new Budget();
+  let ctx: SyncContext | undefined;
+  let kind: SyncResult["kind"] = "incremental";
+  let phase = "initializing";
+  let done = false;
+  try {
+    // 0009 can run before an old Worker invocation finishes. It may restore a
+    // canonical cursor or have committed pages before an alias guard aborts
+    // its next page. Finalize only after that run is gone; keep the marker
+    // through every failure so cursor reset, rollups and cache can retry.
+    const cleanup = await db
       .prepare(
-        `DELETE FROM sync_state WHERE repo = 'lightningfoundry'
+        "SELECT 1 FROM sync_state WHERE repo = '*' AND source = 'foundry_cleanup'",
+      )
+      .first();
+    if (cleanup) {
+      await db
+        .prepare(
+          `DELETE FROM sync_state WHERE repo = 'lightningfoundry'
          OR (repo = '*' AND source = 'rotation'
            AND lower(json_extract(cursor, '$')) IN (
              'lightningfactory', 'lightning-factory', 'lightning_factory',
              'lightningfoundry', 'lightning-foundry', 'lightning_foundry'))`,
-      )
-      .run();
-    await recomputeRollups(db);
-    await bumpCacheGeneration(env);
-    await db
+        )
+        .run();
+      await recomputeRollups(db);
+      await bumpCacheGeneration(env);
+      await db
+        .prepare(
+          "DELETE FROM sync_state WHERE repo = '*' AND source = 'foundry_cleanup'",
+        )
+        .run();
+    }
+
+    // Finish the event-attribution repair after any old invocation has exited.
+    // Keep the marker until both rollups and the public cache reflect the repair.
+    const attributionCleanup = await db
       .prepare(
-        "DELETE FROM sync_state WHERE repo = '*' AND source = 'foundry_cleanup'",
+        "SELECT 1 FROM sync_state WHERE repo = '*' AND source = 'attribution_cleanup'",
       )
-      .run();
-  }
+      .first();
+    if (attributionCleanup) {
+      await recomputeRollups(db);
+      await bumpCacheGeneration(env);
+      await db
+        .prepare(
+          "DELETE FROM sync_state WHERE repo = '*' AND source = 'attribution_cleanup'",
+        )
+        .run();
+    }
 
-  // Finish the event-attribution repair after any old invocation has exited.
-  // Keep the marker until both rollups and the public cache reflect the repair.
-  const attributionCleanup = await db
-    .prepare(
-      "SELECT 1 FROM sync_state WHERE repo = '*' AND source = 'attribution_cleanup'",
-    )
-    .first();
-  if (attributionCleanup) {
-    await recomputeRollups(db);
-    await bumpCacheGeneration(env);
-    await db
-      .prepare(
-        "DELETE FROM sync_state WHERE repo = '*' AND source = 'attribution_cleanup'",
-      )
-      .run();
-  }
-
-  const ctx: SyncContext = {
-    env,
-    db,
-    budget: new Budget(),
-    resolver: await ContributorResolver.load(db),
-    eventsWritten: 0,
-  };
-
-  const repos = await activeRepos(ctx);
-  const state = await loadSyncState(db);
-  const kind = isBackfilling(state, repos) ? "backfill" : "incremental";
-  const run = await db
-    .prepare(
-      "INSERT INTO sync_runs (kind, started_at, status) VALUES (?, ?, 'running') RETURNING id",
-    )
-    .bind(kind, now)
-    .first<{ id: number }>();
-  const runId = run!.id;
-
-  const lastLead = (state.get(stateKey(ROTATION_REPO, ROTATION_SOURCE)) ??
-    null) as string | null;
-  const order = rotated(repos, lastLead);
-  if (order.length > 0 && order[0].name !== lastLead) {
-    await syncStateUpsert(
+    ctx = {
+      env,
       db,
-      ROTATION_REPO,
-      ROTATION_SOURCE,
-      order[0].name,
-    ).run();
-  }
+      budget,
+      resolver: await ContributorResolver.load(db),
+      eventsWritten: 0,
+    };
 
-  let done = false;
-  try {
+    const repos = await activeRepos(ctx);
+    const state = await loadSyncState(db);
+    kind = isBackfilling(state, repos) ? "backfill" : "incremental";
+    phase = "syncing";
+    await db
+      .prepare("UPDATE sync_runs SET kind = ?, detail = ? WHERE id = ?")
+      .bind(kind, JSON.stringify({ trigger, phase }), runId)
+      .run();
+
+    const lastLead = (state.get(stateKey(ROTATION_REPO, ROTATION_SOURCE)) ??
+      null) as string | null;
+    const order = rotated(repos, lastLead);
+    if (order.length > 0 && order[0].name !== lastLead) {
+      await syncStateUpsert(
+        db,
+        ROTATION_REPO,
+        ROTATION_SOURCE,
+        order[0].name,
+      ).run();
+    }
+
     done = true;
     for (const repo of order) {
       const commitsDone = await syncCommits(
@@ -249,10 +260,11 @@ export async function runSync(
         new Date().toISOString(),
         JSON.stringify({
           trigger,
+          phase,
           partial: true,
           error: message,
-          eventsWritten: ctx.eventsWritten,
-          budgetSpent: ctx.budget.spent,
+          eventsWritten: ctx?.eventsWritten ?? 0,
+          budgetSpent: budget.spent,
         }),
         runId,
       )
@@ -269,7 +281,7 @@ export async function runSync(
     skipped: false,
     done,
     kind,
-    eventsWritten: ctx.eventsWritten,
-    budgetSpent: ctx.budget.spent,
+    eventsWritten: ctx?.eventsWritten ?? 0,
+    budgetSpent: budget.spent,
   };
 }
