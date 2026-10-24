@@ -8,9 +8,10 @@ export type CommitsState =
   | { phase: "incremental"; since: string };
 
 // Shared with the PR walker (prs.ts), which reads the same fields off each
-// PR's branch commits.
+// PR's branch commits. Line counts are unused by contribution accounting and
+// make nested PR history queries expensive enough to time out at GitHub.
 export const COMMIT_FIELDS = `
-  oid committedDate messageHeadline additions deletions
+  oid committedDate messageHeadline
   author { name email date user { login databaseId avatarUrl } }`;
 
 const QUERY = `
@@ -32,8 +33,6 @@ export interface CommitNode {
   oid: string;
   committedDate: string;
   messageHeadline: string;
-  additions: number;
-  deletions: number;
   author: {
     name: string | null;
     email: string | null;
@@ -92,8 +91,6 @@ export function commitEvent(node: CommitNode): ParsedEvent {
     },
     payload: {
       headline: node.messageHeadline,
-      additions: node.additions,
-      deletions: node.deletions,
       authoredAt: node.author?.date ?? null,
     },
   };
