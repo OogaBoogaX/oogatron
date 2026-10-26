@@ -200,10 +200,11 @@ never need lockstep deploys:
   >7 days), its own per-repo `leaderboards {commits,prs,reviews,comments,issues}`,
   and `contributors [{login, last_seen_at}]` — per-repo last activity, which
   is what routes each island Ooga to the cave of the repo they contributed
-  to; plus `recent` — the newest `RECENT_DEPTH` (12, `worker/src/config.ts`)
-  events **per (repo, contributor, type) cell**, unioned and ordered
+  to; plus `recent` — the newest `RECENT_DEPTH` (10, `worker/src/config.ts`)
+  events **per (repo, contributor, type) cell**, plus complete first-ten
+  60-second windows for every public-type subset per (repo, contributor), ordered
   newest-first, as `[{login, repo, type:
-  commit|pr|review|merge|issue|comment, occurred_at}]`, merge-commit-deduped
+  commit|pr|review|merge|issue|comment, occurred_at, event_key}]`, merge-commit-deduped
   and bot-filtered. The per-cell depth is what lets the island filter the
   feed client-side by any combination of repos, contributors and types and
   still show its 10 newest rows (a selection is a union of cells, and an
@@ -375,3 +376,18 @@ Default `*.workers.dev` URL is fine; custom domain later if desired.
   fold shapeV2 away.
 - Private data of any kind. Public contributor handles and public activity only,
   matching oogaboogaland's privacy stance.
+
+## Recent activity selection
+
+`recent` selects from the full event history. For each (repo, contributor) pair it
+keeps the first ten individual events of each public type and every member of
+the first ten rolling windows for all 63 nonempty type subsets. Repo and user
+selections are unions of those pairs. Filtering precedes rolling and limiting;
+a window starts at its newest event and accepts timestamps strictly less than
+60 seconds older, crossing UTC-minute boundaries without chaining. The complete
+window keeps counts, highest-ranked types and draft markers intact. Equal times
+rank merge, PR, commit, review, issue, comment, then stable `event_key` (repo plus
+source external ID). The island must retain keys in both baked and live data.
+Snapshot volume depends on burst size. Raw database history and payloads are
+unchanged: archive pruning is deferred under oogaboogaland#113 because storage
+and billing savings have not been demonstrated at the current scale.
