@@ -242,7 +242,9 @@ describe("/v2/stats (schema 3)", () => {
     const commits = rows.filter((r) => r.type === "commit");
     expect(commits).toHaveLength(RECENT_DEPTH);
     expect(commits.every((r) => r.login === "alice")).toBe(true);
-    expect(commits[0].occurred_at).toBe("2026-02-01T15:00:00Z");
+    expect(commits[0].occurred_at).toBe(
+      `2026-02-01T${String(RECENT_DEPTH + 3).padStart(2, "0")}:00:00Z`,
+    );
     expect(commits[RECENT_DEPTH - 1].occurred_at).toBe("2026-02-01T04:00:00Z");
 
     // Older singles in other cells all survive, so a repo, contributor or
@@ -269,7 +271,9 @@ describe("/v2/stats (schema 3)", () => {
     // 8 comment_issue + 8 comment_review seeded; served as one capped cell.
     expect(comments).toHaveLength(RECENT_DEPTH);
     expect(comments[0].occurred_at).toBe("2026-01-20T15:00:00Z");
-    expect(comments[RECENT_DEPTH - 1].occurred_at).toBe("2026-01-20T04:00:00Z");
+    expect(comments[RECENT_DEPTH - 1].occurred_at).toBe(
+      `2026-01-20T${String(16 - RECENT_DEPTH).padStart(2, "0")}:00:00Z`,
+    );
   });
 
   it("keeps bot cells out of recent unless ?include_bots=1", async () => {

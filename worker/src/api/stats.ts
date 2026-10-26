@@ -1,4 +1,4 @@
-import { RECENT_DEPTH } from "../config";
+import { retainRecent } from "../db/recent";
 import { botFilter } from "../db/queries";
 import { COUNTED } from "../db/rollups";
 import { isoWeek } from "../util/isoweek";
@@ -22,6 +22,7 @@ interface RollupRow {
 }
 
 interface RecentRow {
+  event_key: string;
   login: string;
   repo: string;
   type: string;
@@ -134,28 +135,16 @@ async function assembleModel(env: Env, url: URL): Promise<StatsModel> {
        FROM daily_rollups r JOIN contributors c ON c.id = r.contributor_id
        WHERE 1=1${botFilter(url)}`,
       ),
-      // The recent feed reads raw events (rollups are day-grained); the same
-      // merge-commit exclusion keeps a merged PR from showing twice. It keeps
-      // the newest RECENT_DEPTH events per (repo, contributor, public type)
-      // cell rather than org-wide, so the island's client-side filters (any
-      // combination of repos, contributors and types) never run dry: a
-      // filtered selection is a union of cells, and an event among the newest
-      // N of a union is among the newest N of its own cell. Comment surfaces
-      // share a cell because shapeV3 folds them into one "comment" type. One
-      // full pass over counted events plus a sort — the same order of work as
-      // the two GROUP BY reads below.
+      // Read compact display facts, never archival API payloads. Keep exact
+      // timing until all type-filter windows have been selected in retainRecent.
       env.DB.prepare(
-        `SELECT login, repo, type, occurred_at, payload FROM (
-           SELECT c.login, e.repo, e.type, e.occurred_at, e.payload, e.id,
-                  ROW_NUMBER() OVER (
-                    PARTITION BY e.repo, e.contributor_id,
-                      CASE WHEN e.type LIKE 'comment_%' THEN 'comment' ELSE e.type END
-                    ORDER BY e.occurred_at DESC, e.id DESC) AS rn
-           FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
-           WHERE ${COUNTED}${botFilter(url)})
-         WHERE rn <= ?
-         ORDER BY occurred_at DESC, id DESC`,
-      ).bind(RECENT_DEPTH),
+        `SELECT e.repo || '/' || e.external_id AS event_key,
+                c.login, e.repo, e.type, e.occurred_at,
+                CASE WHEN json_valid(e.payload) AND json_extract(e.payload, '$.draft') = 1
+                     THEN '{"draft":true}' ELSE NULL END AS payload
+         FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
+         WHERE ${COUNTED}${botFilter(url)}`,
+      ),
       env.DB.prepare(
         `SELECT e.repo, MAX(e.occurred_at) AS at
        FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
@@ -176,7 +165,7 @@ async function assembleModel(env: Env, url: URL): Promise<StatsModel> {
     ]);
   const contributors = contribRes.results as unknown as ContributorRow[];
   const rollups = rollupRes.results as unknown as RollupRow[];
-  const recent = recentRes.results as unknown as RecentRow[];
+  const recent = retainRecent(recentRes.results as unknown as RecentRow[]);
   const lastActivity = lastRes.results as unknown as LastActivityRow[];
   const repoContributors =
     repoContribRes.results as unknown as RepoContributorRow[];
@@ -418,6 +407,7 @@ export function shapeV3(model: StatsModel): Record<string, unknown> {
       ),
     recent: model.recent.map((r) => {
       const row: Record<string, unknown> = {
+        event_key: r.event_key,
         login: r.login,
         repo: r.repo,
         type: recentType(r.type),
