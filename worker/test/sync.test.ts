@@ -508,6 +508,62 @@ describe("bot identity", () => {
 });
 
 describe("stale-run guard", () => {
+  it("retains a cleanup marker and cache generation when summary reconciliation fails", async () => {
+    const now = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO repos VALUES ('quiet', 'rock', 0, ?, ?)",
+      ).bind(now, now),
+      env.DB.prepare(
+        "INSERT INTO contributors (id, login) VALUES (1, 'alice')",
+      ),
+      env.DB.prepare(
+        "INSERT INTO activity_events (contributor_id, type, external_id, occurred_at) VALUES (1, 'commit', 'kept', ?)",
+      ).bind(now),
+      // An existing cleanup must remove this vanished bucket. Fail after
+      // its replacement aggregate has been upserted to exercise rollback.
+      env.DB.prepare(
+        "INSERT INTO daily_rollups VALUES ('entropylab', '2020-01-01', 1, 'pr', 1)",
+      ),
+      env.DB.prepare(
+        `CREATE TRIGGER fail_cleanup_delete BEFORE DELETE ON daily_rollups
+         BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END`,
+      ),
+    ]);
+    await env.CACHE.put("cache:gen", "before-failed-cleanup");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await expect(runSync(env, "cron")).rejects.toThrow(
+      "injected cleanup failure",
+    );
+    expect(await env.CACHE.get("cache:gen")).toBe("before-failed-cleanup");
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM sync_state WHERE source = 'foundry_cleanup'",
+      ).first(),
+    ).not.toBeNull();
+    expect(
+      (await env.DB.prepare("SELECT day, type, count FROM daily_rollups").all())
+        .results,
+    ).toEqual([{ day: "2020-01-01", type: "pr", count: 1 }]);
+    await env.DB.prepare("DROP TRIGGER fail_cleanup_delete").run();
+    const retry = await runSync(env, "cron");
+    expect(retry).toMatchObject({
+      skipped: false,
+      done: true,
+      eventsWritten: 0,
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM sync_state WHERE source = 'foundry_cleanup'",
+      ).first(),
+    ).toBeNull();
+    expect(
+      (await env.DB.prepare("SELECT day, type, count FROM daily_rollups").all())
+        .results,
+    ).toEqual([{ day: now.slice(0, 10), type: "commit", count: 1 }]);
+    expect(await env.CACHE.get("cache:gen")).not.toBe("before-failed-cleanup");
+  });
+
   it("records initialization failures and recovers on the next attempt", async () => {
     const now = new Date().toISOString();
     await env.DB.batch([

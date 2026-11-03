@@ -1,8 +1,10 @@
-// Full recompute after every sync that actually changed an event (unchanged
-// re-upserts count zero — see eventUpsertStatements): one batch, one pass
-// over activity_events, and it eliminates the incremental-invalidation bug
-// class entirely (late-arriving events, bot reclassification, edited
-// payloads). Revisit around ~100k events.
+// Recompute counts from all history after a sync actually changed an event
+// (unchanged re-upserts count zero — see eventUpsertStatements). Keep the
+// global reconciliation rules for late arrivals, corrections and dedupe,
+// but write only changed summaries and remove keys that no longer count.
+// Both flag updates and summary reconciliation stay in one atomic D1 batch.
+// The extra grouped-key read trades some background query time for fewer
+// summary writes; raw events, refresh cadence and API reads are unchanged.
 //
 // Commit dedupe, materialized into activity_events.counted once per rebuild
 // rather than re-derived per request (as a correlated subquery it read ~160
@@ -51,13 +53,26 @@ export async function recomputeRollups(db: D1Database): Promise<void> {
       `UPDATE activity_events SET counted = 1
        WHERE counted = 0 AND id NOT IN (${UNCOUNTED_IDS})`,
     ),
-    db.prepare("DELETE FROM daily_rollups"),
     db.prepare(
       `INSERT INTO daily_rollups (repo, day, contributor_id, type, count)
        SELECT repo, substr(occurred_at, 1, 10), contributor_id, type, COUNT(*)
        FROM activity_events e
        WHERE ${COUNTED}
-       GROUP BY 1, 2, 3, 4`,
+       GROUP BY 1, 2, 3, 4
+       ON CONFLICT(repo, day, contributor_id, type) DO UPDATE SET
+         count = excluded.count
+       WHERE daily_rollups.count IS NOT excluded.count`,
+    ),
+    // All tuple components are NOT NULL in the schema (occurred_at supplies
+    // day), so NOT IN cannot be poisoned by a NULL key. This also removes a
+    // final bucket after a correction, deletion or counted-flag change.
+    db.prepare(
+      `DELETE FROM daily_rollups
+       WHERE (repo, day, contributor_id, type) NOT IN (
+         SELECT repo, substr(occurred_at, 1, 10), contributor_id, type
+         FROM activity_events e
+         WHERE ${COUNTED}
+         GROUP BY 1, 2, 3, 4)`,
     ),
   ]);
 }
