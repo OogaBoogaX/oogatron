@@ -1,7 +1,20 @@
 import { env } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { recomputeRollups } from "../src/db/rollups";
 import { isoWeek } from "../src/util/isoweek";
+
+afterEach(() => vi.restoreAllMocks());
+
+async function measuredRecompute(): Promise<number[]> {
+  const batch = vi.spyOn(env.DB, "batch");
+  try {
+    await recomputeRollups(env.DB);
+    const results = await batch.mock.results[0].value;
+    return results.map((result: D1Result) => result.meta.changes);
+  } finally {
+    batch.mockRestore();
+  }
+}
 
 async function seed(): Promise<void> {
   await env.DB.batch([
@@ -19,6 +32,95 @@ async function seed(): Promise<void> {
 }
 
 describe("recomputeRollups", () => {
+  it("writes only changed counts, preserving numeric equality and raw payloads", async () => {
+    await seed();
+    await recomputeRollups(env.DB);
+    const raw = () =>
+      env.DB.prepare("SELECT * FROM activity_events ORDER BY id").all();
+    const before = (await raw()).results;
+
+    // INTEGER affinity preserves an equivalent textual/real count as the
+    // same value; a no-op rebuild must not rewrite it or unrelated buckets.
+    await env.DB.prepare(
+      "UPDATE daily_rollups SET count = '2.0' WHERE count = 2",
+    ).run();
+    expect(await measuredRecompute()).toEqual([0, 0, 0, 0]);
+    expect((await raw()).results).toEqual(before);
+
+    await env.DB.prepare(
+      "UPDATE activity_events SET payload = '{\"draft\":true}' WHERE external_id = 'e3'",
+    ).run();
+    const edited = (await raw()).results;
+    expect(await measuredRecompute()).toEqual([0, 0, 0, 0]);
+    expect((await raw()).results).toEqual(edited);
+
+    await env.DB.prepare(
+      "INSERT INTO activity_events (contributor_id, type, external_id, occurred_at) VALUES (1, 'commit', 'extra', '2026-01-05T23:00:00Z')",
+    ).run();
+    expect(await measuredRecompute()).toEqual([0, 0, 1, 0]);
+    expect(await measuredRecompute()).toEqual([0, 0, 0, 0]);
+  });
+
+  it("moves corrected buckets, backfills old history and removes vanished keys", async () => {
+    await seed();
+    await recomputeRollups(env.DB);
+    await env.DB.prepare(
+      "UPDATE activity_events SET contributor_id = 2, occurred_at = '2024-12-31T23:59:59Z' WHERE external_id = 'e3'",
+    ).run();
+    expect(await measuredRecompute()).toEqual([0, 0, 1, 1]);
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT day, contributor_id, count FROM daily_rollups WHERE type = 'pr'",
+        ).all()
+      ).results,
+    ).toEqual([{ day: "2024-12-31", contributor_id: 2, count: 1 }]);
+    await env.DB.prepare(
+      "DELETE FROM activity_events WHERE external_id = 'e3'",
+    ).run();
+    expect(await measuredRecompute()).toEqual([0, 0, 0, 1]);
+    await env.DB.prepare("DELETE FROM activity_events").run();
+    expect(await measuredRecompute()).toEqual([0, 0, 0, 2]);
+    expect(
+      (await env.DB.prepare("SELECT * FROM daily_rollups").all()).results,
+    ).toEqual([]);
+    expect(await measuredRecompute()).toEqual([0, 0, 0, 0]);
+  });
+
+  it("rolls back flags and summaries together if final deletion fails, then retries", async () => {
+    await seed();
+    await recomputeRollups(env.DB);
+    await env.DB.prepare(
+      `INSERT INTO activity_events (contributor_id, type, external_id, occurred_at, payload)
+       VALUES (1, 'merge', 'new-merge', '2026-01-07T00:00:00Z', '{"mergeCommit":"e1"}')`,
+    ).run();
+    await env.DB.prepare(
+      "DELETE FROM activity_events WHERE external_id = 'e3'",
+    ).run();
+    const snapshot = async () => ({
+      events: (
+        await env.DB.prepare("SELECT * FROM activity_events ORDER BY id").all()
+      ).results,
+      rollups: (
+        await env.DB.prepare(
+          "SELECT * FROM daily_rollups ORDER BY repo, day, contributor_id, type",
+        ).all()
+      ).results,
+    });
+    const before = await snapshot();
+    await env.DB.prepare(
+      `CREATE TRIGGER fail_rollup_delete BEFORE DELETE ON daily_rollups
+       BEGIN SELECT RAISE(ABORT, 'injected summary failure'); END`,
+    ).run();
+    await expect(recomputeRollups(env.DB)).rejects.toThrow(
+      "injected summary failure",
+    );
+    expect(await snapshot()).toEqual(before);
+    await env.DB.prepare("DROP TRIGGER fail_rollup_delete").run();
+    expect(await measuredRecompute()).toEqual([1, 0, 2, 1]);
+    expect(await measuredRecompute()).toEqual([0, 0, 0, 0]);
+  });
+
   it("prunes sync_runs by index", async () => {
     const prune = await env.DB.prepare(
       "EXPLAIN QUERY PLAN DELETE FROM sync_runs WHERE started_at < ? AND status != 'running'",
