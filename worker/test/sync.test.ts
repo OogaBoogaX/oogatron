@@ -637,3 +637,286 @@ describe("stale-run guard", () => {
     expect(stale!.detail).toContain("[marked stale]");
   });
 });
+
+describe("account rename identity safety", () => {
+  const actor = (githubId: number | null, login: string | null) => ({
+    githubId,
+    login,
+    displayName: null,
+    avatarUrl: null,
+    typename: "User",
+    email: null,
+  });
+  const resolve = async (
+    resolver: ContributorResolver,
+    githubId: number | null,
+    login: string | null,
+    at = "2026-11-04T03:00:00Z",
+  ) => {
+    const statements: D1PreparedStatement[] = [];
+    const name = await resolver.resolve(
+      env.DB,
+      actor(githubId, login),
+      at,
+      statements,
+    );
+    await env.DB.batch(statements);
+    return name;
+  };
+  it("plain noreply and login-only case variants retain the existing contributor and event attribution", async () => {
+    await env.DB.prepare(
+      "INSERT INTO contributors(id,github_id,login) VALUES(7,2002,'MixedCase')",
+    ).run();
+    const resolver = await ContributorResolver.load(env.DB);
+    const statements: D1PreparedStatement[] = [];
+    const name = await resolver.resolve(
+      env.DB,
+      { ...actor(null, null), email: "mixedcase@users.noreply.github.com" },
+      "2026-11-04T03:00:00Z",
+      statements,
+    );
+    expect(name).toBe("MixedCase");
+    statements.push(
+      env.DB.prepare(
+        "INSERT INTO activity_events(repo,contributor_id,type,external_id,occurred_at,payload) VALUES('entropylab',(SELECT id FROM contributors WHERE login=?),'commit','plain-noreply','2026-11-04T03:00:00Z','{}')",
+      ).bind(name),
+    );
+    await env.DB.batch(statements);
+    expect(await resolve(resolver, null, "MIXEDCASE")).toBe("MixedCase");
+    expect(
+      await env.DB.prepare(
+        "SELECT contributor_id FROM activity_events WHERE external_id='plain-noreply'",
+      ).first("contributor_id"),
+    ).toBe(7);
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT id,github_id,login FROM contributors",
+        ).all()
+      ).results,
+    ).toEqual([{ id: 7, github_id: 2002, login: "MixedCase" }]);
+    await expect(resolve(resolver, 99, "mixedcase")).rejects.toThrow(
+      "identity collision",
+    );
+    expect(await resolve(resolver, 2002, "MIXEDCASE")).toBe("MIXEDCASE");
+    expect(await resolve(resolver, null, "mixedcase")).toBe("MIXEDCASE");
+  });
+  it("refuses migration on existing case-variant rows without changing history, then accepts a reviewed repair", async () => {
+    await env.DB.batch([
+      env.DB.prepare("DROP TRIGGER contributor_identity_insert"),
+      env.DB.prepare("DROP TRIGGER contributor_identity_update"),
+      env.DB.prepare("DROP TABLE contributor_login_history"),
+      env.DB.prepare("DROP INDEX contributors_login_nocase"),
+      env.DB.prepare(
+        "INSERT INTO contributors(id,github_id,login) VALUES(7,2002,'MixedCase'),(8,99,'mixedcase')",
+      ),
+      env.DB.prepare(
+        "INSERT INTO activity_events(repo,contributor_id,type,external_id,occurred_at,payload) VALUES('entropylab',7,'commit','first','2026-11-01T00:00:00Z','{}'),('entropylab',8,'commit','second','2026-11-01T00:00:00Z','{}')",
+      ),
+      env.DB.prepare(
+        "INSERT INTO daily_rollups(repo,day,contributor_id,type,count) VALUES('entropylab','2026-11-01',7,'commit',1),('entropylab','2026-11-01',8,'commit',1)",
+      ),
+    ]);
+    const before = await env.DB.prepare(
+      "SELECT * FROM activity_events ORDER BY id",
+    ).all();
+    const rollups = await env.DB.prepare(
+      "SELECT * FROM daily_rollups ORDER BY contributor_id",
+    ).all();
+    const migration = env.TEST_MIGRATIONS.find((m) =>
+      m.name.startsWith("0011_"),
+    )!;
+    await expect(
+      env.DB.batch(migration.queries.map((q) => env.DB.prepare(q))),
+    ).rejects.toThrow("UNIQUE constraint failed");
+    expect(
+      await env.DB.prepare(
+        "SELECT name FROM sqlite_master WHERE name='contributor_login_history'",
+      ).first(),
+    ).toBeNull();
+    await expect(ContributorResolver.load(env.DB)).rejects.toThrow(
+      "Case-variant contributor rows require review",
+    );
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT id,github_id,login FROM contributors ORDER BY id",
+        ).all()
+      ).results,
+    ).toEqual([
+      { id: 7, github_id: 2002, login: "MixedCase" },
+      { id: 8, github_id: 99, login: "mixedcase" },
+    ]);
+    // Fixture for an independently verified second account's current login;
+    // production repair requires the documented backup and operator review.
+    await env.DB.prepare(
+      "UPDATE contributors SET login='OtherAccount' WHERE id=8",
+    ).run();
+    await env.DB.batch(migration.queries.map((q) => env.DB.prepare(q)));
+    const resolver = await ContributorResolver.load(env.DB);
+    expect(await resolve(resolver, null, "mixedcase")).toBe("MixedCase");
+    expect(await resolve(resolver, 99, "OtherAccount")).toBe("OtherAccount");
+    expect(
+      (await env.DB.prepare("SELECT * FROM activity_events ORDER BY id").all())
+        .results,
+    ).toEqual(before.results);
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT * FROM daily_rollups ORDER BY contributor_id",
+        ).all()
+      ).results,
+    ).toEqual(rollups.results);
+  });
+  it("rejects a claimant first and stale resolver races without transferring existing contributions", async () => {
+    const stale = await ContributorResolver.load(env.DB);
+    await env.DB.prepare(
+      "INSERT INTO contributors(github_id,login) VALUES(185141343,'Bitcoin-Bill')",
+    ).run();
+    const resolver = await ContributorResolver.load(env.DB);
+    await expect(resolve(resolver, 99, "bitcoin-bill")).rejects.toThrow(
+      "identity collision",
+    );
+    await expect(resolve(stale, 99, "Bitcoin-Bill")).rejects.toThrow(
+      "identity collision",
+    );
+    expect(
+      await env.DB.prepare(
+        "SELECT github_id FROM contributors WHERE login='Bitcoin-Bill'",
+      ).first("github_id"),
+    ).toBe(185141343);
+    await resolve(resolver, 185141343, "Bitclank-Bill");
+    await resolve(resolver, 99, "Bitcoin-Bill");
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT github_id,login FROM contributors ORDER BY github_id",
+        ).all()
+      ).results,
+    ).toEqual([
+      { github_id: 99, login: "Bitcoin-Bill" },
+      { github_id: 185141343, login: "Bitclank-Bill" },
+    ]);
+  });
+  it("a rename preserves row identity, events, rollups and unrelated contributors", async () => {
+    await env.DB.prepare(
+      "INSERT INTO contributors(id,github_id,login) VALUES(7,185141343,'Bitcoin-Bill'),(8,99,'other')",
+    ).run();
+    await env.DB.prepare(
+      "INSERT INTO activity_events(repo,contributor_id,type,external_id,occurred_at,payload) VALUES('entropylab',7,'commit','historical','2026-11-01T00:00:00Z','{}')",
+    ).run();
+    await env.DB.prepare(
+      "INSERT INTO daily_rollups(repo,day,contributor_id,type,count) VALUES('entropylab','2026-11-01',7,'commit',1)",
+    ).run();
+    const before = await env.DB.prepare("SELECT * FROM activity_events").all();
+    const rollups = await env.DB.prepare("SELECT * FROM daily_rollups").all();
+    await resolve(
+      await ContributorResolver.load(env.DB),
+      185141343,
+      "Bitclank-Bill",
+    );
+    expect(
+      (await env.DB.prepare("SELECT * FROM activity_events").all()).results,
+    ).toEqual(before.results);
+    expect(
+      (await env.DB.prepare("SELECT * FROM daily_rollups").all()).results,
+    ).toEqual(rollups.results);
+    expect(
+      await env.DB.prepare(
+        "SELECT id FROM contributors WHERE login='Bitclank-Bill'",
+      ).first("id"),
+    ).toBe(7);
+    expect(
+      await env.DB.prepare("SELECT login FROM contributors WHERE id=8").first(
+        "login",
+      ),
+    ).toBe("other");
+  });
+  it("an occupied destination aborts rather than merging unverifiable duplicate identities", async () => {
+    await env.DB.prepare(
+      "INSERT INTO contributors(github_id,login) VALUES(185141343,'Bitcoin-Bill'),(99,'Bitclank-Bill')",
+    ).run();
+    await expect(
+      resolve(
+        await ContributorResolver.load(env.DB),
+        185141343,
+        "Bitclank-Bill",
+      ),
+    ).rejects.toThrow("identity collision");
+    await expect(
+      env.DB.prepare(
+        "UPDATE contributors SET github_id=99 WHERE github_id=185141343",
+      ).run(),
+    ).rejects.toThrow("identity collision");
+  });
+  it("does not adopt an unverified login-only row or edit historical evidence", async () => {
+    await env.DB.prepare(
+      "INSERT INTO contributors(login) VALUES('Bitcoin-Bill')",
+    ).run();
+    await expect(
+      resolve(
+        await ContributorResolver.load(env.DB),
+        185141343,
+        "Bitcoin-Bill",
+      ),
+    ).rejects.toThrow("identity collision");
+    await expect(
+      env.DB.prepare(
+        "UPDATE contributors SET github_id=185141343 WHERE login='Bitcoin-Bill'",
+      ).run(),
+    ).rejects.toThrow("identity collision");
+    await env.DB.prepare(
+      "INSERT INTO contributors(github_id,login) VALUES(185141343,'Bitclank-Bill')",
+    ).run();
+    await env.DB.prepare(
+      "INSERT INTO contributor_login_history(login,github_id,valid_before) VALUES('Bitcoin-Bill',185141343,'2026-11-04T02:00:00Z')",
+    ).run();
+    await expect(
+      env.DB.prepare("DELETE FROM contributor_login_history").run(),
+    ).rejects.toThrow("requires review");
+    await expect(
+      env.DB.prepare(
+        "UPDATE contributor_login_history SET valid_before='2026-11-05T00:00:00Z'",
+      ).run(),
+    ).rejects.toThrow("requires review");
+    expect(
+      await env.DB.prepare(
+        "SELECT github_id FROM contributors WHERE login='Bitcoin-Bill'",
+      ).first("github_id"),
+    ).toBeNull();
+  });
+  it("reviewed historical cutoff maps only missing-ID events; new claims and stale numeric noreply authors remain distinct", async () => {
+    await env.DB.prepare(
+      "INSERT INTO contributors(github_id,login) VALUES(185141343,'Bitclank-Bill'),(99,'Bitcoin-Bill')",
+    ).run();
+    await env.DB.prepare(
+      "INSERT INTO contributor_login_history(login,github_id,valid_before) VALUES('Bitcoin-Bill',185141343,'2026-11-04T02:00:00Z')",
+    ).run();
+    const resolver = await ContributorResolver.load(env.DB);
+    expect(
+      await resolve(resolver, null, "BITCOIN-BILL", "2026-11-03T00:00:00Z"),
+    ).toBe("Bitclank-Bill");
+    expect(await resolve(resolver, 99, "Bitcoin-Bill")).toBe("Bitcoin-Bill");
+    await expect(resolve(resolver, null, "Bitcoin-Bill")).rejects.toThrow(
+      "Unverified historical",
+    );
+    const statements: D1PreparedStatement[] = [];
+    expect(
+      await resolver.resolve(
+        env.DB,
+        {
+          ...actor(null, null),
+          email: "185141343+Bitcoin-Bill@users.noreply.github.com",
+        },
+        "2026-11-03T00:00:00Z",
+        statements,
+      ),
+    ).toBe("Bitclank-Bill");
+    await env.DB.batch(statements);
+    expect(
+      await env.DB.prepare(
+        "SELECT login FROM contributors WHERE github_id=185141343",
+      ).first("login"),
+    ).toBe("Bitclank-Bill");
+  });
+});
