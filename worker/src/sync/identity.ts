@@ -19,6 +19,10 @@ interface KnownContributor {
 export class ContributorResolver {
   private byGithubId = new Map<number, KnownContributor>();
   private byLogin = new Map<string, KnownContributor>();
+  private history = new Map<
+    string,
+    { github_id: number; valid_before: string }
+  >();
 
   static async load(db: D1Database): Promise<ContributorResolver> {
     const r = new ContributorResolver();
@@ -27,9 +31,16 @@ export class ContributorResolver {
       .all<{ login: string; github_id: number | null }>();
     for (const row of rows.results) {
       const known = { login: row.login, githubId: row.github_id };
-      r.byLogin.set(row.login, known);
+      r.byLogin.set(row.login.toLowerCase(), known);
       if (row.github_id !== null) r.byGithubId.set(row.github_id, known);
     }
+    const history = await db
+      .prepare(
+        "SELECT login, github_id, valid_before FROM contributor_login_history",
+      )
+      .all<{ login: string; github_id: number; valid_before: string }>();
+    for (const row of history.results)
+      r.history.set(row.login.toLowerCase(), row);
     return r;
   }
 
@@ -51,6 +62,21 @@ export class ContributorResolver {
       }
     }
     a = attributedActor(a);
+    // Operator-reviewed history is time-bounded. Explicit GitHub IDs always win;
+    // a later claimant never inherits old events just by taking the spelling.
+    const historical =
+      a.login && a.githubId === null
+        ? this.history.get(a.login.toLowerCase())
+        : null;
+    if (historical) {
+      if (
+        Date.parse(occurredAt) > Date.parse(historical.valid_before) ||
+        !Number.isFinite(Date.parse(occurredAt)) ||
+        !this.byGithubId.has(historical.github_id)
+      )
+        throw new Error("Unverified historical contributor identity");
+      a = { ...a, githubId: historical.github_id, login: null };
+    }
     if (!a.login && !a.githubId) {
       a = { ...a, login: "ghost", displayName: "Deleted user" };
     }
@@ -62,6 +88,9 @@ export class ContributorResolver {
     if (a.githubId !== null && this.byGithubId.has(a.githubId)) {
       const known = this.byGithubId.get(a.githubId)!;
       const login = a.login ?? known.login;
+      const occupied = this.byLogin.get(login.toLowerCase());
+      if (occupied && occupied !== known)
+        throw new Error("Contributor identity collision");
       statements.push(
         db
           .prepare(
@@ -80,18 +109,20 @@ export class ContributorResolver {
           .bind(login, occurredAt, a.displayName, a.avatarUrl, a.githubId),
       );
       if (known.login !== login) {
-        this.byLogin.delete(known.login);
+        this.byLogin.delete(known.login.toLowerCase());
         known.login = login;
-        this.byLogin.set(login, known);
+        this.byLogin.set(login.toLowerCase(), known);
       }
       return login;
     }
 
     const login = a.login!;
+    const occupied = this.byLogin.get(login.toLowerCase());
+    if (occupied && a.githubId !== null && occupied.githubId !== a.githubId)
+      throw new Error("Contributor identity collision");
 
-    // Rule 2/3: upsert by login (also attaches a newly-learned github_id to a
-    // row first created without one; in-memory maps make id collisions with a
-    // different row impossible, since rule 1 would have matched).
+    // Rule 2/3: upsert by login only when identity is compatible. Attaching an
+    // ID to a previously unverified login requires a separately reviewed repair.
     statements.push(
       db
         .prepare(
@@ -123,15 +154,10 @@ export class ContributorResolver {
         ),
     );
 
-    const existing = this.byLogin.get(login);
-    if (existing) {
-      if (existing.githubId === null && a.githubId !== null) {
-        existing.githubId = a.githubId;
-        this.byGithubId.set(a.githubId, existing);
-      }
-    } else {
+    const existing = this.byLogin.get(login.toLowerCase());
+    if (!existing) {
       const known = { login, githubId: a.githubId };
-      this.byLogin.set(login, known);
+      this.byLogin.set(login.toLowerCase(), known);
       if (a.githubId !== null) this.byGithubId.set(a.githubId, known);
     }
     return login;
