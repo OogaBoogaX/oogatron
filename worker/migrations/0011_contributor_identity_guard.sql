@@ -1,5 +1,10 @@
 -- Prepared before a rename. History stays empty until an operator verifies the
 -- same GitHub ID after the rename and records the last verified old-login time.
+-- Preflight every case-folded login first (see docs/account-renames.md). This
+-- first statement refuses an unresolved duplicate instead of deploying a resolver
+-- that would choose one row arbitrarily. It neither merges nor deletes history.
+CREATE UNIQUE INDEX contributors_login_nocase ON contributors(login COLLATE NOCASE);
+
 CREATE TABLE contributor_login_history (
   login TEXT PRIMARY KEY COLLATE NOCASE,
   github_id INTEGER NOT NULL REFERENCES contributors(github_id),

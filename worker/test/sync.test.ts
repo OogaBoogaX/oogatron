@@ -663,6 +663,111 @@ describe("account rename identity safety", () => {
     await env.DB.batch(statements);
     return name;
   };
+  it("plain noreply and login-only case variants retain the existing contributor and event attribution", async () => {
+    await env.DB.prepare(
+      "INSERT INTO contributors(id,github_id,login) VALUES(7,2002,'MixedCase')",
+    ).run();
+    const resolver = await ContributorResolver.load(env.DB);
+    const statements: D1PreparedStatement[] = [];
+    const name = await resolver.resolve(
+      env.DB,
+      { ...actor(null, null), email: "mixedcase@users.noreply.github.com" },
+      "2026-11-04T03:00:00Z",
+      statements,
+    );
+    expect(name).toBe("MixedCase");
+    statements.push(
+      env.DB.prepare(
+        "INSERT INTO activity_events(repo,contributor_id,type,external_id,occurred_at,payload) VALUES('entropylab',(SELECT id FROM contributors WHERE login=?),'commit','plain-noreply','2026-11-04T03:00:00Z','{}')",
+      ).bind(name),
+    );
+    await env.DB.batch(statements);
+    expect(await resolve(resolver, null, "MIXEDCASE")).toBe("MixedCase");
+    expect(
+      await env.DB.prepare(
+        "SELECT contributor_id FROM activity_events WHERE external_id='plain-noreply'",
+      ).first("contributor_id"),
+    ).toBe(7);
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT id,github_id,login FROM contributors",
+        ).all()
+      ).results,
+    ).toEqual([{ id: 7, github_id: 2002, login: "MixedCase" }]);
+    await expect(resolve(resolver, 99, "mixedcase")).rejects.toThrow(
+      "identity collision",
+    );
+    expect(await resolve(resolver, 2002, "MIXEDCASE")).toBe("MIXEDCASE");
+    expect(await resolve(resolver, null, "mixedcase")).toBe("MIXEDCASE");
+  });
+  it("refuses migration on existing case-variant rows without changing history, then accepts a reviewed repair", async () => {
+    await env.DB.batch([
+      env.DB.prepare("DROP TRIGGER contributor_identity_insert"),
+      env.DB.prepare("DROP TRIGGER contributor_identity_update"),
+      env.DB.prepare("DROP TABLE contributor_login_history"),
+      env.DB.prepare("DROP INDEX contributors_login_nocase"),
+      env.DB.prepare(
+        "INSERT INTO contributors(id,github_id,login) VALUES(7,2002,'MixedCase'),(8,99,'mixedcase')",
+      ),
+      env.DB.prepare(
+        "INSERT INTO activity_events(repo,contributor_id,type,external_id,occurred_at,payload) VALUES('entropylab',7,'commit','first','2026-11-01T00:00:00Z','{}'),('entropylab',8,'commit','second','2026-11-01T00:00:00Z','{}')",
+      ),
+      env.DB.prepare(
+        "INSERT INTO daily_rollups(repo,day,contributor_id,type,count) VALUES('entropylab','2026-11-01',7,'commit',1),('entropylab','2026-11-01',8,'commit',1)",
+      ),
+    ]);
+    const before = await env.DB.prepare(
+      "SELECT * FROM activity_events ORDER BY id",
+    ).all();
+    const rollups = await env.DB.prepare(
+      "SELECT * FROM daily_rollups ORDER BY contributor_id",
+    ).all();
+    const migration = env.TEST_MIGRATIONS.find((m) =>
+      m.name.startsWith("0011_"),
+    )!;
+    await expect(
+      env.DB.batch(migration.queries.map((q) => env.DB.prepare(q))),
+    ).rejects.toThrow("UNIQUE constraint failed");
+    expect(
+      await env.DB.prepare(
+        "SELECT name FROM sqlite_master WHERE name='contributor_login_history'",
+      ).first(),
+    ).toBeNull();
+    await expect(ContributorResolver.load(env.DB)).rejects.toThrow(
+      "Case-variant contributor rows require review",
+    );
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT id,github_id,login FROM contributors ORDER BY id",
+        ).all()
+      ).results,
+    ).toEqual([
+      { id: 7, github_id: 2002, login: "MixedCase" },
+      { id: 8, github_id: 99, login: "mixedcase" },
+    ]);
+    // Fixture for an independently verified second account's current login;
+    // production repair requires the documented backup and operator review.
+    await env.DB.prepare(
+      "UPDATE contributors SET login='OtherAccount' WHERE id=8",
+    ).run();
+    await env.DB.batch(migration.queries.map((q) => env.DB.prepare(q)));
+    const resolver = await ContributorResolver.load(env.DB);
+    expect(await resolve(resolver, null, "mixedcase")).toBe("MixedCase");
+    expect(await resolve(resolver, 99, "OtherAccount")).toBe("OtherAccount");
+    expect(
+      (await env.DB.prepare("SELECT * FROM activity_events ORDER BY id").all())
+        .results,
+    ).toEqual(before.results);
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT * FROM daily_rollups ORDER BY contributor_id",
+        ).all()
+      ).results,
+    ).toEqual(rollups.results);
+  });
   it("rejects a claimant first and stale resolver races without transferring existing contributions", async () => {
     const stale = await ContributorResolver.load(env.DB);
     await env.DB.prepare(

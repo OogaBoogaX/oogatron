@@ -30,6 +30,8 @@ export class ContributorResolver {
       .prepare("SELECT login, github_id FROM contributors")
       .all<{ login: string; github_id: number | null }>();
     for (const row of rows.results) {
+      if (r.byLogin.has(row.login.toLowerCase()))
+        throw new Error("Case-variant contributor rows require review");
       const known = { login: row.login, githubId: row.github_id };
       r.byLogin.set(row.login.toLowerCase(), known);
       if (row.github_id !== null) r.byGithubId.set(row.github_id, known);
@@ -116,10 +118,12 @@ export class ContributorResolver {
       return login;
     }
 
-    const login = a.login!;
-    const occupied = this.byLogin.get(login.toLowerCase());
+    const occupied = this.byLogin.get(a.login!.toLowerCase());
     if (occupied && a.githubId !== null && occupied.githubId !== a.githubId)
       throw new Error("Contributor identity collision");
+    // A plain noreply address is lowercased, but event subqueries and the
+    // login-only upsert must use the existing row's exact canonical spelling.
+    const login = occupied?.login ?? a.login!;
 
     // Rule 2/3: upsert by login only when identity is compatible. Attaching an
     // ID to a previously unverified login requires a separately reviewed repair.
