@@ -215,6 +215,9 @@ export async function runSync(
       await recomputeRollups(db);
       await reconcileBots(db);
       await bumpCacheGeneration(env);
+    } else if (ctx.contributorsChanged) {
+      // A renamed or newly seen contributor is in the served stats too.
+      await bumpCacheGeneration(env);
     }
 
     await db

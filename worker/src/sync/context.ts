@@ -10,6 +10,9 @@ export interface SyncContext {
   budget: Budget;
   resolver: ContributorResolver;
   eventsWritten: number;
+  // Contributor rows a page actually changed: the stats show them, so the
+  // response cache is bumped for these too (api/cache.ts).
+  contributorsChanged?: number;
 }
 
 // Persists one page atomically: contributor upserts, event upserts, and the
@@ -50,6 +53,10 @@ export async function persistPage(
   // full rollup rebuild on every tick.
   for (let i = eventsFrom; i < eventsTo; i++) {
     ctx.eventsWritten += results[i].meta.changes ?? 0;
+  }
+  for (let i = 0; i < eventsFrom; i++) {
+    ctx.contributorsChanged =
+      (ctx.contributorsChanged ?? 0) + (results[i].meta.changes ?? 0);
   }
 }
 

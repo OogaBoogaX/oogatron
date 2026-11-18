@@ -423,11 +423,12 @@ describe("ContributorResolver", () => {
       const resolver = await ContributorResolver.load(env.DB);
       const statements: D1PreparedStatement[] = [];
       await resolver.resolve(env.DB, actor, "2026-01-10T10:00:00Z", statements);
+      if (!statements.length) return [];
       const results = await env.DB.batch(statements);
       return results.map((r) => r.meta.changes ?? 0);
     };
     expect(await changes()).toEqual([1]); // rule 2/3: insert
-    expect(await changes()).toEqual([0]); // rule 1: unchanged refresh
+    expect(await changes()).toEqual([]); // rule 1: unchanged, nothing sent
     // A genuinely newer event still moves last_seen_at.
     const resolver = await ContributorResolver.load(env.DB);
     const statements: D1PreparedStatement[] = [];
@@ -441,6 +442,42 @@ describe("ContributorResolver", () => {
       first_seen_at: "2026-01-10T10:00:00Z",
       last_seen_at: "2026-02-01T00:00:00Z",
     });
+  });
+
+  // Regression: git author names differ between a person's machines, and the
+  // commit overlap re-reads older commits every run, which renamed the row
+  // back and forth on each one (~470k writes a day).
+  it("takes the display name from the newest commit, and older re-reads change nothing", async () => {
+    const actor = (displayName: string) => ({
+      githubId: 5151,
+      login: "wsb",
+      displayName,
+      avatarUrl: "https://avatars.example/wsb",
+      typename: "User",
+      email: null,
+    });
+    const changes = async (name: string, at: string): Promise<number[]> => {
+      const resolver = await ContributorResolver.load(env.DB);
+      const statements: D1PreparedStatement[] = [];
+      await resolver.resolve(env.DB, actor(name), at, statements);
+      if (!statements.length) return [];
+      const results = await env.DB.batch(statements);
+      return results.map((r) => r.meta.changes ?? 0);
+    };
+    const name = async () =>
+      (await env.DB.prepare(
+        "SELECT display_name FROM contributors WHERE login = 'wsb'",
+      ).first<{ display_name: string }>())!.display_name;
+    expect(await changes("Laptop Name", "2026-03-01T00:00:00Z")).toEqual([1]);
+    expect(await changes("Desktop Name", "2026-03-02T00:00:00Z")).toEqual([1]);
+    expect(await name()).toBe("Desktop Name");
+    for (let i = 0; i < 3; i++) {
+      expect(await changes("Laptop Name", "2026-03-01T00:00:00Z")).toEqual([]);
+      expect(await changes("Desktop Name", "2026-03-02T00:00:00Z")).toEqual([]);
+    }
+    expect(await name()).toBe("Desktop Name");
+    expect(await changes("Laptop Name", "2026-03-03T00:00:00Z")).toEqual([1]);
+    expect(await name()).toBe("Laptop Name");
   });
 });
 
@@ -968,7 +1005,8 @@ describe("account rename identity safety", () => {
         statements,
       ),
     ).toBe("Bitclank-Bill");
-    await env.DB.batch(statements);
+    // Nothing about the row changes, so nothing is sent.
+    expect(statements).toEqual([]);
     expect(
       await env.DB.prepare(
         "SELECT login FROM contributors WHERE github_id=185141343",
