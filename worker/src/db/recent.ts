@@ -59,3 +59,58 @@ export function retainRecent<T extends RecentEvent>(input: T[]): T[] {
   }
   return sorted.filter((row) => keep.has(row));
 }
+
+// How many of each (repo, contributor, raw type)'s newest counted events
+// /v2/stats reads for the feed, instead of every event in history.
+export const RECENT_FETCH = 48;
+
+// retainRecent never keeps a row that comes at or after the start of the
+// (RECENT_DEPTH + 1)th window of its own raw type in its own pair:
+// - its rank's ten raw rows all come before it (a window holds at least one);
+// - a mask's windows start greedily from the newest row, and a sequence that
+//   holds more rows starts each window at the same time or later, so every
+//   mask containing the type has opened its last window by then, and the
+//   rows after that are never kept for it.
+// Dropping such rows therefore changes nothing retainRecent keeps, nor the
+// order of what it keeps. Given each group's newest rows (all rows at or after
+// its RECENT_FETCH-th newest timestamp, ties included), this names the groups
+// whose fetch may have stopped short of that point and must be read whole: a
+// full group of RECENT_FETCH or more that has not opened its next window, or
+// any group with a timestamp outside GitHub's second-precision UTC format,
+// whose text order (what the query cuts by) might not be its time order.
+const CANONICAL = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
+
+export function shortGroups<T extends RecentEvent & { contributor_id: number }>(
+  rows: T[],
+): Array<{ repo: string; contributor_id: number; type: string }> {
+  const groups = new Map<string, T[]>();
+  for (const row of rows) {
+    const key = JSON.stringify([row.repo, row.contributor_id, row.type]);
+    let group = groups.get(key);
+    if (!group) groups.set(key, (group = []));
+    group.push(row);
+  }
+  const short: Array<{ repo: string; contributor_id: number; type: string }> =
+    [];
+  for (const group of groups.values()) {
+    const { repo, contributor_id, type } = group[0];
+    if (group.some((r) => !CANONICAL.test(r.occurred_at))) {
+      short.push({ repo, contributor_id, type });
+      continue;
+    }
+    if (group.length < RECENT_FETCH) continue;
+    const stamps = group
+      .map((r) => Date.parse(r.occurred_at))
+      .sort((a, b) => b - a);
+    let windows = 0,
+      start = Infinity;
+    for (const stamp of stamps) {
+      if (start - stamp >= 60000) {
+        start = stamp;
+        if (++windows > RECENT_DEPTH) break;
+      }
+    }
+    if (windows <= RECENT_DEPTH) short.push({ repo, contributor_id, type });
+  }
+  return short;
+}

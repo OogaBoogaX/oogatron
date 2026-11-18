@@ -67,8 +67,8 @@ Design principles, from the spec:
 
 ## How activity is counted
 
-Events are stored raw and complete; what the API *counts* is decided once per
-rollup rebuild and stored on each event as `activity_events.counted`, so every
+Events are stored raw and complete; what the API *counts* is decided as events
+change and stored on each event as `activity_events.counted`, so every
 read path (rollups, the recent feed, per-contributor queries) filters on one
 flag instead of re-deriving dedupe rules per request.
 
@@ -181,17 +181,30 @@ changing it:
 - **Never re-derive dedupe per request.** Filter on `counted` (the `COUNTED`
   constant in `worker/src/db/rollups.ts`). Correlated subqueries in the stats
   path once cost ~570k row reads per cache miss.
-- **The recent feed is one full pass over `activity_events` per cache miss**
-  (a window function keeps the newest 12 per repo/contributor/type cell; no
-  index can serve that partition). It is the same order of work as the two
-  per-repo `GROUP BY` reads beside it, so leave it as one statement rather
-  than one query per cell.
+- **The recent feed reads a bounded slice, never all history.** Each
+  (repo, contributor, type) is read back to its 48th newest counted event on
+  `idx_events_counted_recent`, about 3,800 rows in all instead of every counted
+  event. A row past its own type's eleventh one-minute window can never be
+  kept (see `shortGroups` in `worker/src/db/recent.ts`), so a group whose
+  slice stops short of that point is read whole, and the feed is exactly what
+  all history gives. It relies on GitHub's `YYYY-MM-DDTHH:MM:SSZ` timestamps
+  sorting as text in time order; a group with any other form is read whole.
+- **Rollups follow events; never recount them per sync.** Migration 0012's
+  triggers move an event's `daily_rollups` bucket as it is inserted, edited,
+  (un)counted or deleted, and note in `counted_dirty` every commit identity
+  group or oid whose dedupe may have moved; `reconcileRollups` re-evaluates
+  only those commits, by index seeks. A sync that writes one event reads tens
+  of rows for it instead of the ~230k a rebuild from all history costs. The
+  full `recomputeRollups` stays for migrations, cleanups and a once-a-day
+  check that logs `rollups_drift` if it ever has to fix anything. Count
+  written events from the upsert's `RETURNING`, never `meta.changes`, which
+  includes what the triggers write.
 - **Every upsert is guarded** so an unchanged row writes nothing. The sync
   re-fetches overlap windows every minute; unguarded writes to events or
   contributors turn that into millions of rewrites a day.
 - **Both commit walkers must emit byte-identical payloads**, or the guarded
-  upsert flips the row between them every run and forces a full rollup
-  rebuild each tick.
+  upsert flips the row between them every run and forces a rollup
+  reconcile and a stats rebuild each tick.
 
 To check usage:
 

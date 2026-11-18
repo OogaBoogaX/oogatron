@@ -1,6 +1,6 @@
 import { STALE_RUN_MINUTES, SYNC_RUNS_RETENTION_DAYS } from "../config";
 import { loadSyncState, stateKey, syncStateUpsert } from "../db/queries";
-import { recomputeRollups } from "../db/rollups";
+import { reconcileRollups, recomputeRollups } from "../db/rollups";
 import { bumpCacheGeneration } from "../api/cache";
 import { Budget } from "./budget";
 import { reconcileBots } from "./bots";
@@ -30,6 +30,8 @@ export interface SyncResult {
 // have; it records which repo led the last run's rotation.
 const ROTATION_REPO = "*";
 const ROTATION_SOURCE = "rotation";
+// The UTC day the full rollup rebuild last confirmed the incremental one.
+const CHECKED_SOURCE = "rollups_checked";
 
 function isBackfilling(state: Map<string, unknown>, repos: RepoRef[]): boolean {
   return repos.some((repo) =>
@@ -212,12 +214,39 @@ export async function runSync(
     }
 
     if (ctx.eventsWritten > 0) {
-      await recomputeRollups(db);
+      await reconcileRollups(db);
       await reconcileBots(db);
       await bumpCacheGeneration(env);
     } else if (ctx.contributorsChanged) {
       // A renamed or newly seen contributor is in the served stats too.
       await bumpCacheGeneration(env);
+    }
+
+    // Once a UTC day, rebuild from all history (a few hundred thousand rows
+    // read) to prove the incremental rollups kept up. It writes only what
+    // differs; anything it had to fix is logged and served at once.
+    const today = now.slice(0, 10);
+    // A failure here is the check's alone: the run's own work is done, and the
+    // next run tries again.
+    if (state.get(stateKey(ROTATION_REPO, CHECKED_SOURCE)) !== today) {
+      try {
+        const drift = await recomputeRollups(db);
+        if (drift > 0) {
+          console.warn(
+            JSON.stringify({ event: "rollups_drift", runId, changes: drift }),
+          );
+          await bumpCacheGeneration(env);
+        }
+        await syncStateUpsert(db, ROTATION_REPO, CHECKED_SOURCE, today).run();
+      } catch (check) {
+        console.error(
+          JSON.stringify({
+            event: "rollups_check_failed",
+            runId,
+            message: check instanceof Error ? check.message : String(check),
+          }),
+        );
+      }
     }
 
     await db
@@ -254,16 +283,17 @@ export async function runSync(
     // Rate limiting is an expected, graceful stop: cursors for completed
     // pages are already persisted, the next run resumes.
     const status = e instanceof RateLimited ? "ok" : "error";
-    // Pages committed before the stop are in D1 however the run ended. The
-    // next run's overlap re-reads them with nothing new to write, so it would
-    // neither rebuild the rollups nor move the cache generation, and a cached
+    // Pages committed before the stop are in D1 however the run ended, their
+    // buckets already moved by the triggers. The next run's overlap re-reads
+    // them with nothing new to write, so it would neither settle their dedupe
+    // flags nor move the cache generation, and a cached
     // /v2/stats body would hide them for its whole TTL while stamping each
     // hit as current. Finish them here; a failure is logged, never in the way
     // of recording the stop.
     if (ctx && (ctx.eventsWritten > 0 || ctx.contributorsChanged)) {
       try {
         if (ctx.eventsWritten > 0) {
-          await recomputeRollups(db);
+          await reconcileRollups(db);
           await reconcileBots(db);
         }
       } catch (rebuild) {

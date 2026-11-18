@@ -1,4 +1,4 @@
-import { retainRecent } from "../db/recent";
+import { RECENT_FETCH, retainRecent, shortGroups } from "../db/recent";
 import { botFilter } from "../db/queries";
 import { COUNTED } from "../db/rollups";
 import { isoWeek } from "../util/isoweek";
@@ -25,9 +25,77 @@ interface RecentRow {
   event_key: string;
   login: string;
   repo: string;
+  contributor_id: number;
   type: string;
   occurred_at: string;
   payload: string | null;
+}
+
+// Read compact display facts, never archival API payloads. Keep exact timing
+// until all type-filter windows have been selected in retainRecent.
+const RECENT_COLUMNS = `e.repo || '/' || e.external_id AS event_key,
+  c.login, e.repo, e.contributor_id, e.type, e.occurred_at,
+  CASE WHEN json_valid(e.payload) AND json_extract(e.payload, '$.draft') = 1
+       THEN '{"draft":true}' ELSE NULL END AS payload`;
+
+// More short groups than this and one full pass is cheaper than a statement
+// each (and stays far inside D1's per-invocation query limit).
+const SHORT_MAX = 40;
+
+// The feed's candidates: each (repo, contributor, raw type)'s newest counted
+// events back to its RECENT_FETCH-th newest timestamp (ties included), one
+// range on idx_events_counted_recent each, rather than every counted event in
+// history; the groups are the rollups' (exactly the pairs and types with
+// counted events). shortGroups (db/recent.ts) says which groups that bound
+// might have cut short, and those are read whole, so retainRecent keeps
+// exactly what it would from all history.
+function recentStatement(env: Env, url: URL): D1PreparedStatement {
+  return env.DB.prepare(
+    `WITH k AS MATERIALIZED (
+       SELECT g.repo, g.contributor_id, g.type, COALESCE((
+         SELECT x.occurred_at FROM activity_events x
+         WHERE x.repo = g.repo AND x.contributor_id = g.contributor_id
+           AND x.type = g.type AND x.counted = 1
+         ORDER BY x.occurred_at DESC LIMIT 1 OFFSET ${RECENT_FETCH - 1}), '') AS since
+       FROM (SELECT DISTINCT r.repo, r.contributor_id, r.type
+             FROM daily_rollups r JOIN contributors c ON c.id = r.contributor_id
+             WHERE 1=1${botFilter(url)}) g)
+     SELECT ${RECENT_COLUMNS}
+     FROM k CROSS JOIN activity_events e
+       ON e.repo = k.repo AND e.contributor_id = k.contributor_id
+      AND e.type = k.type AND e.counted = 1 AND e.occurred_at >= k.since
+     JOIN contributors c ON c.id = e.contributor_id`,
+  );
+}
+
+async function recentRows(env: Env, url: URL, rows: RecentRow[]) {
+  const short = shortGroups(rows);
+  if (short.length === 0) return rows;
+  if (short.length > SHORT_MAX) {
+    const all = await env.DB.prepare(
+      `SELECT ${RECENT_COLUMNS}
+       FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
+       WHERE ${COUNTED}${botFilter(url)}`,
+    ).all<RecentRow>();
+    return all.results;
+  }
+  const whole = await env.DB.batch<RecentRow>(
+    short.map((g) =>
+      env.DB.prepare(
+        `SELECT ${RECENT_COLUMNS}
+         FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
+         WHERE e.repo = ? AND e.contributor_id = ? AND e.type = ? AND ${COUNTED}`,
+      ).bind(g.repo, g.contributor_id, g.type),
+    ),
+  );
+  const replaced = new Set(
+    short.map((g) => JSON.stringify([g.repo, g.contributor_id, g.type])),
+  );
+  return rows
+    .filter(
+      (r) => !replaced.has(JSON.stringify([r.repo, r.contributor_id, r.type])),
+    )
+    .concat(whole.flatMap((res) => res.results));
 }
 
 interface LastActivityRow {
@@ -135,37 +203,42 @@ async function assembleModel(env: Env, url: URL): Promise<StatsModel> {
        FROM daily_rollups r JOIN contributors c ON c.id = r.contributor_id
        WHERE 1=1${botFilter(url)}`,
       ),
-      // Read compact display facts, never archival API payloads. Keep exact
-      // timing until all type-filter windows have been selected in retainRecent.
+      recentStatement(env, url),
+      // Each repo's latest event of any kind, walked back from the newest on
+      // idx_events_repo_time only as far as the first non-bot one. Repos come
+      // from the rollups, which hold every repo a slice can be built for.
       env.DB.prepare(
-        `SELECT e.repo || '/' || e.external_id AS event_key,
-                c.login, e.repo, e.type, e.occurred_at,
-                CASE WHEN json_valid(e.payload) AND json_extract(e.payload, '$.draft') = 1
-                     THEN '{"draft":true}' ELSE NULL END AS payload
+        `SELECT p.repo, (
+         SELECT e.occurred_at
          FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
-         WHERE ${COUNTED}${botFilter(url)}`,
-      ),
-      env.DB.prepare(
-        `SELECT e.repo, MAX(e.occurred_at) AS at
-       FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
-       WHERE 1=1${botFilter(url)}
-       GROUP BY e.repo`,
+         WHERE e.repo = p.repo${botFilter(url)}
+         ORDER BY e.occurred_at DESC LIMIT 1) AS at
+       FROM (SELECT DISTINCT repo FROM daily_rollups) p
+       ORDER BY p.repo`,
       ),
       // Per-repo per-contributor last activity: what lets the island route a
       // clanking Ooga to the cave of the repo they actually contributed to.
-      // The merge-commit exclusion keeps membership identical by construction
-      // to the rollup-derived repos[].totals.contributors, so consumers may
-      // assert the two counts align.
+      // The pairs are the rollups' (every pair with a counted event), so
+      // membership is identical by construction to the rollup-derived
+      // repos[].totals.contributors and consumers may assert the two align;
+      // each pair's latest counted event is one seek on
+      // idx_events_counted_pair_time rather than a scan of every event.
       env.DB.prepare(
-        `SELECT e.repo, c.login, MAX(e.occurred_at) AS at
-       FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
-       WHERE ${COUNTED}${botFilter(url)}
-       GROUP BY e.repo, e.contributor_id`,
+        `SELECT p.repo, c.login, (
+         SELECT MAX(e.occurred_at) FROM activity_events e
+         WHERE e.repo = p.repo AND e.contributor_id = p.contributor_id
+           AND ${COUNTED}) AS at
+       FROM (SELECT DISTINCT repo, contributor_id FROM daily_rollups) p
+       JOIN contributors c ON c.id = p.contributor_id
+       WHERE 1=1${botFilter(url)}
+       ORDER BY p.repo, p.contributor_id`,
       ),
     ]);
   const contributors = contribRes.results as unknown as ContributorRow[];
   const rollups = rollupRes.results as unknown as RollupRow[];
-  const recent = retainRecent(recentRes.results as unknown as RecentRow[]);
+  const recent = retainRecent(
+    await recentRows(env, url, recentRes.results as unknown as RecentRow[]),
+  );
   const lastActivity = lastRes.results as unknown as LastActivityRow[];
   const repoContributors =
     repoContribRes.results as unknown as RepoContributorRow[];

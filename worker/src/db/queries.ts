@@ -11,8 +11,9 @@ export interface ResolvedEvent {
 
 // The DO UPDATE is guarded so re-upserting an unchanged event (incremental
 // overlap windows re-fetch the same pages every run) writes nothing and
-// reports zero changes — which is what lets a quiet sync skip the rollup
-// rebuild.
+// returns no row — which is what lets a quiet sync skip the rollup
+// reconcile. RETURNING names exactly the events inserted or changed;
+// meta.changes would also count what migration 0012's triggers write.
 //
 // Multi-row upserts chunked to stay well under D1's ~100 bound-parameter
 // limit per statement (6 params per row).
@@ -51,7 +52,8 @@ export function eventUpsertStatements(
              payload        = excluded.payload
            WHERE contributor_id IS NOT excluded.contributor_id
               OR occurred_at    IS NOT excluded.occurred_at
-              OR payload        IS NOT excluded.payload`,
+              OR payload        IS NOT excluded.payload
+           RETURNING id`,
         )
         .bind(...params),
     );

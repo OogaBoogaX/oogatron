@@ -257,7 +257,8 @@ describe("full sync against recorded GraphQL pages", () => {
     expect(state.get("*/rotation")).toBe("entropylab");
 
     // Second run: incremental, and re-upserting the same pages changes nothing
-    // — and reports nothing, so no rollup rebuild is triggered.
+    // — and reports nothing, so no rollup reconcile is triggered. The day's
+    // full check already ran on the first run, so nothing rebuilds them.
     expect(first.eventsWritten).toBe(15);
     await env.DB.prepare("DELETE FROM daily_rollups WHERE type = 'pr'").run();
     const second = await runSync(env, "admin");
@@ -268,7 +269,7 @@ describe("full sync against recorded GraphQL pages", () => {
     const prRollups = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM daily_rollups WHERE type = 'pr'",
     ).first<{ n: number }>();
-    expect(prRollups!.n).toBe(0); // untouched: recomputeRollups did not run
+    expect(prRollups!.n).toBe(0); // untouched: nothing rebuilt them
 
     // An old stored commit with line counts is normalized once, without
     // changing its credit or flipping between the history and PR walkers.
@@ -280,10 +281,23 @@ describe("full sync against recorded GraphQL pages", () => {
     expect(third.eventsWritten).toBe(1);
     expect(await eventCounts()).toEqual(counts);
     expect((await runSync(env, "admin")).eventsWritten).toBe(0);
-    const rebuilt = await env.DB.prepare(
-      "SELECT COUNT(*) AS n FROM daily_rollups WHERE type = 'pr'",
-    ).first<{ n: number }>();
-    expect(rebuilt!.n).toBeGreaterThan(0);
+    // An event write moves only its own buckets: the deleted ones stay gone
+    // until the next day's full check, which finds and repairs them.
+    const prBuckets = () =>
+      env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM daily_rollups WHERE type = 'pr'",
+      ).first<{ n: number }>();
+    expect((await prBuckets())!.n).toBe(0);
+    await env.DB.prepare(
+      "DELETE FROM sync_state WHERE repo = '*' AND source = 'rollups_checked'",
+    ).run();
+    const drift = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await runSync(env, "admin");
+    expect((await prBuckets())!.n).toBeGreaterThan(0);
+    expect(drift.mock.calls.map((c) => JSON.parse(c[0]).event)).toContain(
+      "rollups_drift",
+    );
+    drift.mockRestore();
 
     const contributorCount = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM contributors",
@@ -614,10 +628,18 @@ describe("stale-run guard", () => {
         "SELECT 1 FROM sync_state WHERE source = 'foundry_cleanup'",
       ).first(),
     ).not.toBeNull();
+    // Rolled back to before the cleanup: the stale bucket, and the commit's
+    // own, which migration 0012's triggers wrote with the event.
     expect(
-      (await env.DB.prepare("SELECT day, type, count FROM daily_rollups").all())
-        .results,
-    ).toEqual([{ day: "2020-01-01", type: "pr", count: 1 }]);
+      (
+        await env.DB.prepare(
+          "SELECT day, type, count FROM daily_rollups ORDER BY day",
+        ).all()
+      ).results,
+    ).toEqual([
+      { day: "2020-01-01", type: "pr", count: 1 },
+      { day: now.slice(0, 10), type: "commit", count: 1 },
+    ]);
     await env.DB.prepare("DROP TRIGGER fail_cleanup_delete").run();
     const retry = await runSync(env, "cron");
     expect(retry).toMatchObject({
@@ -722,9 +744,12 @@ describe("stale-run guard", () => {
     expect(await pending()).not.toBeNull();
     expect((await runSync(env, "cron")).skipped).toBe(true);
     expect(await pending()).not.toBeNull();
+    // The page's bucket came with its event (migration 0012's triggers), so
+    // only the stale cursors are left for the cleanup to repair.
     expect(
-      (await env.DB.prepare("SELECT * FROM daily_rollups").all()).results,
-    ).toHaveLength(0);
+      (await env.DB.prepare("SELECT repo, count FROM daily_rollups").all())
+        .results,
+    ).toEqual([{ repo: "bananapayserver", count: 1 }]);
 
     await env.DB.prepare("UPDATE sync_runs SET status = 'error'").run();
     await env.CACHE.put("cache:gen", "before-cleanup");
@@ -733,7 +758,11 @@ describe("stale-run guard", () => {
     expect(result.eventsWritten).toBe(0);
     expect(await pending()).toBeNull();
     expect(
-      (await env.DB.prepare("SELECT * FROM sync_state").all()).results,
+      (
+        await env.DB.prepare(
+          "SELECT * FROM sync_state WHERE source != 'rollups_checked'",
+        ).all()
+      ).results,
     ).toHaveLength(0);
     expect(
       (await env.DB.prepare("SELECT repo, count FROM daily_rollups").all())
@@ -842,9 +871,6 @@ describe("account rename identity safety", () => {
       env.DB.prepare(
         "INSERT INTO activity_events(repo,contributor_id,type,external_id,occurred_at,payload) VALUES('entropylab',7,'commit','first','2026-11-01T00:00:00Z','{}'),('entropylab',8,'commit','second','2026-11-01T00:00:00Z','{}')",
       ),
-      env.DB.prepare(
-        "INSERT INTO daily_rollups(repo,day,contributor_id,type,count) VALUES('entropylab','2026-11-01',7,'commit',1),('entropylab','2026-11-01',8,'commit',1)",
-      ),
     ]);
     const before = await env.DB.prepare(
       "SELECT * FROM activity_events ORDER BY id",
@@ -933,9 +959,6 @@ describe("account rename identity safety", () => {
     ).run();
     await env.DB.prepare(
       "INSERT INTO activity_events(repo,contributor_id,type,external_id,occurred_at,payload) VALUES('entropylab',7,'commit','historical','2026-11-01T00:00:00Z','{}')",
-    ).run();
-    await env.DB.prepare(
-      "INSERT INTO daily_rollups(repo,day,contributor_id,type,count) VALUES('entropylab','2026-11-01',7,'commit',1)",
     ).run();
     const before = await env.DB.prepare("SELECT * FROM activity_events").all();
     const rollups = await env.DB.prepare("SELECT * FROM daily_rollups").all();
