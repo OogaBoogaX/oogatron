@@ -16,6 +16,9 @@ import orgRepos from "./fixtures/graphql/org-repos.json";
 // this variable (undici keeps persisted interceptors registered across
 // tests, so per-test intercepts on the same path would shadow each other).
 let orgReposResponse: unknown = orgRepos;
+// Set by a test to have GitHub refuse the PR query as rate limited, after the
+// run has already committed its commit pages.
+let rateLimitPrs = false;
 
 function mockGitHub() {
   fetchMock
@@ -25,7 +28,12 @@ function mockGitHub() {
       const body = JSON.parse(String(opts.body)) as { query: string };
       if (body.query.includes("query OrgRepos")) return orgReposResponse as any;
       if (body.query.includes("query Commits")) return commitsPage;
-      if (body.query.includes("query PRs")) return prsPage;
+      if (body.query.includes("query PRs"))
+        return rateLimitPrs
+          ? ({
+              errors: [{ type: "RATE_LIMITED", message: "rate limited" }],
+            } as any)
+          : prsPage;
       if (body.query.includes("query Issues")) return issuesPage;
       if (body.query.includes("query CommitComments")) return commitComments;
       throw new Error(`unmocked GraphQL query: ${body.query.slice(0, 80)}`);
@@ -423,11 +431,12 @@ describe("ContributorResolver", () => {
       const resolver = await ContributorResolver.load(env.DB);
       const statements: D1PreparedStatement[] = [];
       await resolver.resolve(env.DB, actor, "2026-01-10T10:00:00Z", statements);
+      if (!statements.length) return [];
       const results = await env.DB.batch(statements);
       return results.map((r) => r.meta.changes ?? 0);
     };
     expect(await changes()).toEqual([1]); // rule 2/3: insert
-    expect(await changes()).toEqual([0]); // rule 1: unchanged refresh
+    expect(await changes()).toEqual([]); // rule 1: unchanged, nothing sent
     // A genuinely newer event still moves last_seen_at.
     const resolver = await ContributorResolver.load(env.DB);
     const statements: D1PreparedStatement[] = [];
@@ -441,6 +450,42 @@ describe("ContributorResolver", () => {
       first_seen_at: "2026-01-10T10:00:00Z",
       last_seen_at: "2026-02-01T00:00:00Z",
     });
+  });
+
+  // Regression: git author names differ between a person's machines, and the
+  // commit overlap re-reads older commits every run, which renamed the row
+  // back and forth on each one (~470k writes a day).
+  it("takes the display name from the newest commit, and older re-reads change nothing", async () => {
+    const actor = (displayName: string) => ({
+      githubId: 5151,
+      login: "wsb",
+      displayName,
+      avatarUrl: "https://avatars.example/wsb",
+      typename: "User",
+      email: null,
+    });
+    const changes = async (name: string, at: string): Promise<number[]> => {
+      const resolver = await ContributorResolver.load(env.DB);
+      const statements: D1PreparedStatement[] = [];
+      await resolver.resolve(env.DB, actor(name), at, statements);
+      if (!statements.length) return [];
+      const results = await env.DB.batch(statements);
+      return results.map((r) => r.meta.changes ?? 0);
+    };
+    const name = async () =>
+      (await env.DB.prepare(
+        "SELECT display_name FROM contributors WHERE login = 'wsb'",
+      ).first<{ display_name: string }>())!.display_name;
+    expect(await changes("Laptop Name", "2026-03-01T00:00:00Z")).toEqual([1]);
+    expect(await changes("Desktop Name", "2026-03-02T00:00:00Z")).toEqual([1]);
+    expect(await name()).toBe("Desktop Name");
+    for (let i = 0; i < 3; i++) {
+      expect(await changes("Laptop Name", "2026-03-01T00:00:00Z")).toEqual([]);
+      expect(await changes("Desktop Name", "2026-03-02T00:00:00Z")).toEqual([]);
+    }
+    expect(await name()).toBe("Desktop Name");
+    expect(await changes("Laptop Name", "2026-03-03T00:00:00Z")).toEqual([1]);
+    expect(await name()).toBe("Laptop Name");
   });
 });
 
@@ -504,6 +549,34 @@ describe("bot identity", () => {
     );
     await env.DB.batch(statements);
     expect(login).toBe("bob-renamed");
+  });
+});
+
+// Regression: a run that committed pages and then hit GitHub's rate limit
+// stopped without rebuilding rollups or moving the cache generation, and the
+// next run's overlap re-read wrote nothing new, so neither did it.
+describe("a run stopped by GitHub's rate limit", () => {
+  it("rebuilds the rollups and moves the cache generation for the pages it committed", async () => {
+    orgReposResponse = orgRepos;
+    rateLimitPrs = true;
+    try {
+      await env.CACHE.put("cache:gen", "before-stop");
+      const result = await runSync(env, "cron");
+      expect(result.eventsWritten).toBeGreaterThan(0);
+      expect(await env.CACHE.get("cache:gen")).not.toBe("before-stop");
+      expect(
+        await env.DB.prepare("SELECT COUNT(*) AS n FROM daily_rollups").first(
+          "n",
+        ),
+      ).toBeGreaterThan(0);
+      const run = await env.DB.prepare(
+        "SELECT status, detail FROM sync_runs ORDER BY id DESC LIMIT 1",
+      ).first<{ status: string; detail: string }>();
+      expect(run!.status).toBe("ok");
+      expect(JSON.parse(run!.detail).error).toMatch(/^RateLimited/);
+    } finally {
+      rateLimitPrs = false;
+    }
   });
 });
 
@@ -968,7 +1041,8 @@ describe("account rename identity safety", () => {
         statements,
       ),
     ).toBe("Bitclank-Bill");
-    await env.DB.batch(statements);
+    // Nothing about the row changes, so nothing is sent.
+    expect(statements).toEqual([]);
     expect(
       await env.DB.prepare(
         "SELECT login FROM contributors WHERE github_id=185141343",

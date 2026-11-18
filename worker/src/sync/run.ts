@@ -215,6 +215,9 @@ export async function runSync(
       await recomputeRollups(db);
       await reconcileBots(db);
       await bumpCacheGeneration(env);
+    } else if (ctx.contributorsChanged) {
+      // A renamed or newly seen contributor is in the served stats too.
+      await bumpCacheGeneration(env);
     }
 
     await db
@@ -251,6 +254,40 @@ export async function runSync(
     // Rate limiting is an expected, graceful stop: cursors for completed
     // pages are already persisted, the next run resumes.
     const status = e instanceof RateLimited ? "ok" : "error";
+    // Pages committed before the stop are in D1 however the run ended. The
+    // next run's overlap re-reads them with nothing new to write, so it would
+    // neither rebuild the rollups nor move the cache generation, and a cached
+    // /v2/stats body would hide them for its whole TTL while stamping each
+    // hit as current. Finish them here; a failure is logged, never in the way
+    // of recording the stop.
+    if (ctx && (ctx.eventsWritten > 0 || ctx.contributorsChanged)) {
+      try {
+        if (ctx.eventsWritten > 0) {
+          await recomputeRollups(db);
+          await reconcileBots(db);
+        }
+      } catch (rebuild) {
+        console.error(
+          JSON.stringify({
+            event: "rollups_after_stop_failed",
+            runId,
+            message:
+              rebuild instanceof Error ? rebuild.message : String(rebuild),
+          }),
+        );
+      }
+      try {
+        await bumpCacheGeneration(env);
+      } catch (bump) {
+        console.error(
+          JSON.stringify({
+            event: "cache_bump_after_stop_failed",
+            runId,
+            message: bump instanceof Error ? bump.message : String(bump),
+          }),
+        );
+      }
+    }
     await db
       .prepare(
         "UPDATE sync_runs SET status = ?, finished_at = ?, detail = ? WHERE id = ?",

@@ -306,6 +306,24 @@ describe("/v2/stats (schema 3)", () => {
     const third = await SELF.fetch(`${BASE}/v2/stats`);
     expect(third.headers.get("x-oogatron-cache")).toBeNull();
   });
+
+  // The cache lives until the data changes, so a hit is today's data and is
+  // stamped now: readers judge staleness by meta.generated_at.
+  it("stamps a cache hit with the time it is served, its data unchanged", async () => {
+    await seed();
+    const first = (await (await SELF.fetch(`${BASE}/v2/stats`)).json()) as any;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const hit = await SELF.fetch(`${BASE}/v2/stats`);
+    expect(hit.headers.get("x-oogatron-cache")).toBe("hit");
+    const second = (await hit.json()) as any;
+    expect(Date.parse(second.meta.generated_at)).toBeGreaterThan(
+      Date.parse(first.meta.generated_at),
+    );
+    expect({ ...second, meta: { ...second.meta, generated_at: "" } }).toEqual({
+      ...first,
+      meta: { ...first.meta, generated_at: "" },
+    });
+  });
 });
 
 describe("/v1/contributors", () => {

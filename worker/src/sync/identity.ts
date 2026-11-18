@@ -2,10 +2,36 @@ import { attributedActor } from "./attributions";
 import { isBot } from "./bots";
 import type { ActorRef } from "./types";
 
+// The display name an event may write: its own (when it carries one) only if
+// the row has none yet or the event is newer than the row's last_seen_at, so
+// the name follows a person's newest commit and older re-reads leave it be.
+// ?2 is the event's occurred_at and ?3 its display name.
+const NEWEST_NAME = `CASE WHEN display_name IS NULL OR ?2 > COALESCE(last_seen_at, '')
+  THEN COALESCE(?3, display_name) ELSE display_name END`;
+const NEWEST_EXCLUDED_NAME = `CASE WHEN contributors.display_name IS NULL
+    OR excluded.last_seen_at > COALESCE(contributors.last_seen_at, '')
+  THEN COALESCE(excluded.display_name, contributors.display_name)
+  ELSE contributors.display_name END`;
+
 interface KnownContributor {
   login: string;
   githubId: number | null;
+  // The stored row as this run last left it, when known exactly (loaded at the
+  // start of the run, then kept up to date with each refresh sent). A row made
+  // this run by the login upsert has none, and is always refreshed by SQL.
+  row?: StoredRow;
 }
+
+interface StoredRow {
+  display_name: string | null;
+  avatar_url: string | null;
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+}
+
+// SQLite's MIN and MAX over these ISO strings compare them as bytes, as < does.
+const minText = (a: string, b: string): string => (b < a ? b : a);
+const maxText = (a: string, b: string): string => (b > a ? b : a);
 
 // Resolves ActorRefs to canonical contributor logins, emitting the D1
 // statements that create or refresh contributors rows. All known contributors
@@ -27,12 +53,23 @@ export class ContributorResolver {
   static async load(db: D1Database): Promise<ContributorResolver> {
     const r = new ContributorResolver();
     const rows = await db
-      .prepare("SELECT login, github_id FROM contributors")
-      .all<{ login: string; github_id: number | null }>();
+      .prepare(
+        "SELECT login, github_id, display_name, avatar_url, first_seen_at, last_seen_at FROM contributors",
+      )
+      .all<{ login: string; github_id: number | null } & StoredRow>();
     for (const row of rows.results) {
       if (r.byLogin.has(row.login.toLowerCase()))
         throw new Error("Case-variant contributor rows require review");
-      const known = { login: row.login, githubId: row.github_id };
+      const known: KnownContributor = {
+        login: row.login,
+        githubId: row.github_id,
+        row: {
+          display_name: row.display_name,
+          avatar_url: row.avatar_url,
+          first_seen_at: row.first_seen_at,
+          last_seen_at: row.last_seen_at,
+        },
+      };
       r.byLogin.set(row.login.toLowerCase(), known);
       if (row.github_id !== null) r.byGithubId.set(row.github_id, known);
     }
@@ -87,23 +124,52 @@ export class ContributorResolver {
     // Both writes below are guarded like eventUpsertStatements: overlap
     // windows re-resolve the same actors every run, and an unguarded refresh
     // rewrote a contributor row for every re-sent event (~1.4M writes/day).
+    // The display name is a commit's git author name, which differs between a
+    // person's machines; only an event newer than any seen (or a row with no
+    // name yet) may set it, or the overlap re-read of older commits renamed
+    // the row back and forth every run (~470k writes/day).
     if (a.githubId !== null && this.byGithubId.has(a.githubId)) {
       const known = this.byGithubId.get(a.githubId)!;
       const login = a.login ?? known.login;
       const occupied = this.byLogin.get(login.toLowerCase());
       if (occupied && occupied !== known)
         throw new Error("Contributor identity collision");
+      // The same refresh the UPDATE below makes, worked out from the row in
+      // memory: when it changes nothing, nothing is sent. Overlap re-reads
+      // resolve the same people every run, and each no-op UPDATE still cost a
+      // statement and its reads (~815k a day).
+      const row = known.row;
+      if (row) {
+        const next: StoredRow = {
+          display_name:
+            row.display_name === null || occurredAt > (row.last_seen_at ?? "")
+              ? (a.displayName ?? row.display_name)
+              : row.display_name,
+          avatar_url: a.avatarUrl ?? row.avatar_url,
+          first_seen_at: minText(row.first_seen_at ?? occurredAt, occurredAt),
+          last_seen_at: maxText(row.last_seen_at ?? occurredAt, occurredAt),
+        };
+        if (
+          known.login === login &&
+          next.display_name === row.display_name &&
+          next.avatar_url === row.avatar_url &&
+          next.first_seen_at === row.first_seen_at &&
+          next.last_seen_at === row.last_seen_at
+        )
+          return login;
+        known.row = next;
+      }
       statements.push(
         db
           .prepare(
             `UPDATE contributors SET
-               login = ?1, display_name = COALESCE(?3, display_name),
+               login = ?1, display_name = ${NEWEST_NAME},
                avatar_url = COALESCE(?4, avatar_url),
                first_seen_at = MIN(COALESCE(first_seen_at, ?2), ?2),
                last_seen_at  = MAX(COALESCE(last_seen_at, ?2), ?2)
              WHERE github_id = ?5 AND (
                login IS NOT ?1
-               OR display_name IS NOT COALESCE(?3, display_name)
+               OR display_name IS NOT ${NEWEST_NAME}
                OR avatar_url   IS NOT COALESCE(?4, avatar_url)
                OR first_seen_at IS NOT MIN(COALESCE(first_seen_at, ?2), ?2)
                OR last_seen_at  IS NOT MAX(COALESCE(last_seen_at, ?2), ?2))`,
@@ -124,6 +190,9 @@ export class ContributorResolver {
     // A plain noreply address is lowercased, but event subqueries and the
     // login-only upsert must use the existing row's exact canonical spelling.
     const login = occupied?.login ?? a.login!;
+    // The upsert below may change that row in ways the copy in memory does not
+    // follow, so from here on rule 1 refreshes it by SQL alone.
+    if (occupied) occupied.row = undefined;
 
     // Rule 2/3: upsert by login only when identity is compatible. Attaching an
     // ID to a previously unverified login requires a separately reviewed repair.
@@ -135,13 +204,13 @@ export class ContributorResolver {
            VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(login) DO UPDATE SET
              github_id     = COALESCE(excluded.github_id, contributors.github_id),
-             display_name  = COALESCE(excluded.display_name, contributors.display_name),
+             display_name  = ${NEWEST_EXCLUDED_NAME},
              avatar_url    = COALESCE(excluded.avatar_url, contributors.avatar_url),
              is_bot        = MAX(excluded.is_bot, contributors.is_bot),
              first_seen_at = MIN(COALESCE(contributors.first_seen_at, excluded.first_seen_at), excluded.first_seen_at),
              last_seen_at  = MAX(COALESCE(contributors.last_seen_at, excluded.last_seen_at), excluded.last_seen_at)
            WHERE contributors.github_id IS NOT COALESCE(excluded.github_id, contributors.github_id)
-              OR contributors.display_name IS NOT COALESCE(excluded.display_name, contributors.display_name)
+              OR contributors.display_name IS NOT ${NEWEST_EXCLUDED_NAME}
               OR contributors.avatar_url IS NOT COALESCE(excluded.avatar_url, contributors.avatar_url)
               OR contributors.is_bot IS NOT MAX(excluded.is_bot, contributors.is_bot)
               OR contributors.first_seen_at IS NOT MIN(COALESCE(contributors.first_seen_at, excluded.first_seen_at), excluded.first_seen_at)
