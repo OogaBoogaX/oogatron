@@ -16,6 +16,9 @@ import orgRepos from "./fixtures/graphql/org-repos.json";
 // this variable (undici keeps persisted interceptors registered across
 // tests, so per-test intercepts on the same path would shadow each other).
 let orgReposResponse: unknown = orgRepos;
+// Set by a test to have GitHub refuse the PR query as rate limited, after the
+// run has already committed its commit pages.
+let rateLimitPrs = false;
 
 function mockGitHub() {
   fetchMock
@@ -25,7 +28,12 @@ function mockGitHub() {
       const body = JSON.parse(String(opts.body)) as { query: string };
       if (body.query.includes("query OrgRepos")) return orgReposResponse as any;
       if (body.query.includes("query Commits")) return commitsPage;
-      if (body.query.includes("query PRs")) return prsPage;
+      if (body.query.includes("query PRs"))
+        return rateLimitPrs
+          ? ({
+              errors: [{ type: "RATE_LIMITED", message: "rate limited" }],
+            } as any)
+          : prsPage;
       if (body.query.includes("query Issues")) return issuesPage;
       if (body.query.includes("query CommitComments")) return commitComments;
       throw new Error(`unmocked GraphQL query: ${body.query.slice(0, 80)}`);
@@ -541,6 +549,34 @@ describe("bot identity", () => {
     );
     await env.DB.batch(statements);
     expect(login).toBe("bob-renamed");
+  });
+});
+
+// Regression: a run that committed pages and then hit GitHub's rate limit
+// stopped without rebuilding rollups or moving the cache generation, and the
+// next run's overlap re-read wrote nothing new, so neither did it.
+describe("a run stopped by GitHub's rate limit", () => {
+  it("rebuilds the rollups and moves the cache generation for the pages it committed", async () => {
+    orgReposResponse = orgRepos;
+    rateLimitPrs = true;
+    try {
+      await env.CACHE.put("cache:gen", "before-stop");
+      const result = await runSync(env, "cron");
+      expect(result.eventsWritten).toBeGreaterThan(0);
+      expect(await env.CACHE.get("cache:gen")).not.toBe("before-stop");
+      expect(
+        await env.DB.prepare("SELECT COUNT(*) AS n FROM daily_rollups").first(
+          "n",
+        ),
+      ).toBeGreaterThan(0);
+      const run = await env.DB.prepare(
+        "SELECT status, detail FROM sync_runs ORDER BY id DESC LIMIT 1",
+      ).first<{ status: string; detail: string }>();
+      expect(run!.status).toBe("ok");
+      expect(JSON.parse(run!.detail).error).toMatch(/^RateLimited/);
+    } finally {
+      rateLimitPrs = false;
+    }
   });
 });
 
