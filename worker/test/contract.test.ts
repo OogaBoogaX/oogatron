@@ -18,11 +18,7 @@ async function seed(): Promise<void> {
        VALUES (1, 'commit', 'e1', '2026-01-05T10:00:00Z'),
               (1, 'comment_issue', 'e2', '2026-01-06T10:00:00Z')`,
     ),
-    env.DB.prepare(
-      `INSERT INTO daily_rollups (day, contributor_id, type, count)
-       VALUES ('2026-01-05', 1, 'commit', 1),
-              ('2026-01-06', 1, 'comment_issue', 1)`,
-    ),
+    // daily_rollups follows from these through migration 0012's triggers.
   ]);
 }
 

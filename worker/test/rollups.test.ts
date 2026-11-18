@@ -1,6 +1,12 @@
 import { env } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { recomputeRollups } from "../src/db/rollups";
+import {
+  RECONCILE_FLAGS,
+  reconcileRollups,
+  recomputeRollups,
+} from "../src/db/rollups";
+import { handleStatsV3 } from "../src/api/stats";
+import { publicType, retainRecent } from "../src/db/recent";
 import { isoWeek } from "../src/util/isoweek";
 
 afterEach(() => vi.restoreAllMocks());
@@ -10,7 +16,8 @@ async function measuredRecompute(): Promise<number[]> {
   try {
     await recomputeRollups(env.DB);
     const results = await batch.mock.results[0].value;
-    return results.map((result: D1Result) => result.meta.changes);
+    // The four rebuild statements; the fifth only empties counted_dirty.
+    return results.slice(0, 4).map((result: D1Result) => result.meta.changes);
   } finally {
     batch.mockRestore();
   }
@@ -54,20 +61,27 @@ describe("recomputeRollups", () => {
     expect(await measuredRecompute()).toEqual([0, 0, 0, 0]);
     expect((await raw()).results).toEqual(edited);
 
+    // A new event's bucket moves with the event itself (migration 0012's
+    // triggers), so the full rebuild then finds nothing left to write.
     await env.DB.prepare(
       "INSERT INTO activity_events (contributor_id, type, external_id, occurred_at) VALUES (1, 'commit', 'extra', '2026-01-05T23:00:00Z')",
     ).run();
-    expect(await measuredRecompute()).toEqual([0, 0, 1, 0]);
+    expect(
+      await env.DB.prepare(
+        "SELECT count FROM daily_rollups WHERE day = '2026-01-05' AND contributor_id = 1 AND type = 'commit'",
+      ).first("count"),
+    ).toBe(3);
     expect(await measuredRecompute()).toEqual([0, 0, 0, 0]);
   });
 
-  it("moves corrected buckets, backfills old history and removes vanished keys", async () => {
+  it("moves corrected buckets and removes vanished keys as events change", async () => {
     await seed();
     await recomputeRollups(env.DB);
     await env.DB.prepare(
       "UPDATE activity_events SET contributor_id = 2, occurred_at = '2024-12-31T23:59:59Z' WHERE external_id = 'e3'",
     ).run();
-    expect(await measuredRecompute()).toEqual([0, 0, 1, 1]);
+    // The triggers moved the bucket with the event; nothing is left to fix.
+    expect(await measuredRecompute()).toEqual([0, 0, 0, 0]);
     expect(
       (
         await env.DB.prepare(
@@ -78,9 +92,14 @@ describe("recomputeRollups", () => {
     await env.DB.prepare(
       "DELETE FROM activity_events WHERE external_id = 'e3'",
     ).run();
-    expect(await measuredRecompute()).toEqual([0, 0, 0, 1]);
+    expect(
+      (await env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM daily_rollups WHERE type = 'pr'",
+      ).first<{ n: number }>())!.n,
+    ).toBe(0);
+    expect(await measuredRecompute()).toEqual([0, 0, 0, 0]);
     await env.DB.prepare("DELETE FROM activity_events").run();
-    expect(await measuredRecompute()).toEqual([0, 0, 0, 2]);
+    expect(await measuredRecompute()).toEqual([0, 0, 0, 0]);
     expect(
       (await env.DB.prepare("SELECT * FROM daily_rollups").all()).results,
     ).toEqual([]);
@@ -108,16 +127,23 @@ describe("recomputeRollups", () => {
       ).results,
     });
     const before = await snapshot();
+    // Fail the batch's last statement, after the merge has unflagged e1 and
+    // the triggers have moved its bucket.
     await env.DB.prepare(
-      `CREATE TRIGGER fail_rollup_delete BEFORE DELETE ON daily_rollups
+      `CREATE TRIGGER fail_dirty_delete BEFORE DELETE ON counted_dirty
        BEGIN SELECT RAISE(ABORT, 'injected summary failure'); END`,
     ).run();
     await expect(recomputeRollups(env.DB)).rejects.toThrow(
       "injected summary failure",
     );
     expect(await snapshot()).toEqual(before);
-    await env.DB.prepare("DROP TRIGGER fail_rollup_delete").run();
-    expect(await measuredRecompute()).toEqual([1, 0, 2, 1]);
+    await expect(reconcileRollups(env.DB)).rejects.toThrow(
+      "injected summary failure",
+    );
+    expect(await snapshot()).toEqual(before);
+    await env.DB.prepare("DROP TRIGGER fail_dirty_delete").run();
+    // e1's flag, and (D1 counts trigger writes too) its bucket moving.
+    expect(await measuredRecompute()).toEqual([2, 0, 0, 0]);
     expect(await measuredRecompute()).toEqual([0, 0, 0, 0]);
   });
 
@@ -305,6 +331,305 @@ describe("patch-identity dedupe", () => {
     ]);
     await recomputeRollups(env.DB);
     expect(await counted()).toEqual(["branch-1", "branch-2"]);
+  });
+});
+
+describe("incremental rollups", () => {
+  const plan = async (sql: string) =>
+    (
+      await env.DB.prepare("EXPLAIN QUERY PLAN " + sql).all<{
+        detail: string;
+      }>()
+    ).results.map((r) => r.detail);
+
+  it("reconciles and serves the feed and last activity by seeks, never a scan of every event", async () => {
+    const reconcile = await plan(RECONCILE_FLAGS);
+    expect(reconcile.join("\n")).not.toMatch(/SCAN (e|activity_events)\b/);
+    expect(reconcile.join("\n")).toMatch(/idx_events_commit_identity/);
+    expect(reconcile.join("\n")).toMatch(
+      /idx_events_merge_commit \(repo=\? AND <expr>=\?\)/,
+    );
+
+    // Every statement /v2/stats sends that reads events: the recent feed and
+    // the two last-activity reads.
+    const prepare = vi.spyOn(env.DB, "prepare");
+    await handleStatsV3(env, new Request("https://oogatron.test/v2/stats"));
+    const reads = prepare.mock.calls
+      .map((c) => c[0] as string)
+      .filter((sql) => sql.includes("activity_events"));
+    expect(reads).toHaveLength(3);
+    for (const sql of reads) {
+      const detail = (await plan(sql)).join("\n");
+      expect(detail).not.toMatch(/SCAN (e|x)\b/);
+      expect(detail).toMatch(/SEARCH e USING (COVERING )?INDEX/);
+    }
+    expect(reads.map((sql) => sql).join()).toMatch(/WITH k AS MATERIALIZED/);
+  });
+
+  it("keeps flags and buckets equal to a full rebuild through any sequence of changes", async () => {
+    await env.DB.prepare(
+      "INSERT INTO contributors (id, login, is_bot) VALUES (1, 'alice', 0), (2, 'bob', 0), (3, 'carol', 0)",
+    ).run();
+    // A small space so identities, rebased copies and merge oids collide often.
+    let seed = 0x5eed;
+    const rand = (n: number) => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const pick = <T>(xs: T[]): T => xs[rand(xs.length)];
+    const repos = ["entropylab", "bedrock"];
+    const days = ["2026-03-01", "2026-03-02", "2026-03-03"];
+    const at = () =>
+      `${pick(days)}T${String(10 + rand(3)).padStart(2, "0")}:00:00Z`;
+    const commitPayload = () =>
+      JSON.stringify(
+        rand(5) === 0
+          ? { headline: "x" }
+          : {
+              authoredAt: pick([
+                "2026-02-01T00:00:00Z",
+                "2026-02-02T00:00:00Z",
+              ]),
+              headline: pick(["fix: a", "fix: b", null]),
+            },
+      );
+    const live: Array<{ repo: string; id: string; type: string }> = [];
+    let next = 0;
+    const snapshot = async () => ({
+      flags: (
+        await env.DB.prepare(
+          "SELECT repo, external_id, counted FROM activity_events ORDER BY repo, external_id",
+        ).all()
+      ).results,
+      rollups: (
+        await env.DB.prepare(
+          "SELECT * FROM daily_rollups ORDER BY repo, day, contributor_id, type",
+        ).all()
+      ).results,
+    });
+
+    for (let step = 0; step < 300; step++) {
+      const op = rand(10);
+      const repo = pick(repos);
+      const commits = live.filter((e) => e.type === "commit");
+      if (op < 4 || live.length < 3) {
+        const id = `c${next++}`;
+        live.push({ repo, id, type: "commit" });
+        await env.DB.prepare(
+          "INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload) VALUES (?, ?, 'commit', ?, ?, ?)",
+        )
+          .bind(repo, 1 + rand(2), id, at(), commitPayload())
+          .run();
+      } else if (op === 4) {
+        const id = `m${next++}`;
+        const named = commits.length && rand(4) ? pick(commits) : null;
+        live.push({ repo: named ? named.repo : repo, id, type: "merge" });
+        await env.DB.prepare(
+          "INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload) VALUES (?, 3, 'merge', ?, ?, ?)",
+        )
+          .bind(
+            named ? named.repo : repo,
+            id,
+            at(),
+            JSON.stringify({ mergeCommit: named ? named.id : null }),
+          )
+          .run();
+      } else if (op === 5) {
+        const id = `p${next++}`;
+        live.push({ repo, id, type: "pr" });
+        await env.DB.prepare(
+          "INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload) VALUES (?, ?, 'pr', ?, ?, '{}')",
+        )
+          .bind(repo, 1 + rand(3), id, at())
+          .run();
+      } else {
+        const e = pick(live);
+        const where = " WHERE repo = ? AND external_id = ?";
+        if (op === 6) {
+          await env.DB.prepare(
+            "UPDATE activity_events SET occurred_at = ?" + where,
+          )
+            .bind(at(), e.repo, e.id)
+            .run();
+        } else if (op === 7) {
+          await env.DB.prepare(
+            "UPDATE activity_events SET contributor_id = ?" + where,
+          )
+            .bind(1 + rand(3), e.repo, e.id)
+            .run();
+        } else if (op === 8) {
+          const payload =
+            e.type === "commit"
+              ? commitPayload()
+              : e.type === "merge"
+                ? JSON.stringify({
+                    mergeCommit: commits.length ? pick(commits).id : null,
+                  })
+                : '{"draft":true}';
+          await env.DB.prepare("UPDATE activity_events SET payload = ?" + where)
+            .bind(payload, e.repo, e.id)
+            .run();
+        } else {
+          live.splice(live.indexOf(e), 1);
+          await env.DB.prepare("DELETE FROM activity_events" + where)
+            .bind(e.repo, e.id)
+            .run();
+        }
+      }
+      // Some syncs write several pages before reconciling.
+      if (rand(3) === 0) continue;
+      await reconcileRollups(env.DB);
+      expect(
+        await env.DB.prepare("SELECT COUNT(*) AS n FROM counted_dirty").first(
+          "n",
+        ),
+      ).toBe(0);
+      const incremental = await snapshot();
+      expect(await recomputeRollups(env.DB), `step ${step}`).toBe(0);
+      expect(await snapshot()).toEqual(incremental);
+    }
+    // The run did reach the cases that matter.
+    const uncounted = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM activity_events WHERE counted = 0",
+    ).first<{ n: number }>();
+    expect(uncounted!.n).toBeGreaterThan(0);
+  });
+});
+
+describe("bounded recent feed", () => {
+  // Bursty histories: each (repo, contributor, type) gets `most`/2 to `most`
+  // events, `burst` and `small` setting how many arrive within seconds of the
+  // last, so a group's newest RECENT_FETCH can fall short of eleven windows.
+  async function seed(
+    seedValue: number,
+    most: number,
+    burst: number,
+    small: number,
+    odd = false,
+  ) {
+    let seed = seedValue;
+    const rand = (n: number) => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return (seed >>> 8) % n; // the low bits of this generator cycle
+    };
+    await env.DB.prepare(
+      "INSERT INTO contributors (id, login, is_bot) VALUES (1, 'alice', 0), (2, 'bob', 0), (3, 'robo[bot]', 1)",
+    ).run();
+    const types = [
+      "commit",
+      "pr",
+      "review",
+      "merge",
+      "issue",
+      "comment_issue",
+      "comment_review",
+    ];
+    const rows: string[] = [];
+    let n = 0;
+    for (const repo of ["entropylab", "bedrock"])
+      for (const who of [1, 2, 3])
+        for (const type of types) {
+          let t = Date.UTC(2026, 4, 1) - rand(86400) * 1000;
+          for (let i = (most >> 1) + rand(most >> 1); i > 0; i--) {
+            // One gap in `burst` keeps the next event in the same minute.
+            t -= (rand(burst) === 0 ? rand(small) : 60 + rand(3600)) * 1000;
+            const stamp =
+              odd && n === 7
+                ? new Date(t + 500).toISOString()
+                : new Date(t).toISOString().replace(".000Z", "Z");
+            const payload =
+              type === "merge"
+                ? JSON.stringify({
+                    mergeCommit: rand(3) ? null : `e${rand(n + 1)}`,
+                  })
+                : type === "pr" && rand(4) === 0
+                  ? '{"draft":true}'
+                  : "{}";
+            rows.push(
+              `('${repo}', ${who}, '${type}', 'e${n++}', '${stamp}', '${payload}')`,
+            );
+          }
+        }
+    for (let i = 0; i < rows.length; i += 200)
+      await env.DB.prepare(
+        `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload) VALUES ${rows.slice(i, i + 200).join(", ")}`,
+      ).run();
+    await reconcileRollups(env.DB);
+  }
+
+  // The feed as it was served from every counted event in history.
+  async function fromHistory(bots: boolean) {
+    const all = await env.DB.prepare(
+      `SELECT e.repo || '/' || e.external_id AS event_key, c.login, e.repo, e.type, e.occurred_at,
+         CASE WHEN json_valid(e.payload) AND json_extract(e.payload, '$.draft') = 1
+              THEN '{"draft":true}' ELSE NULL END AS payload
+       FROM activity_events e JOIN contributors c ON c.id = e.contributor_id
+       WHERE e.counted = 1${bots ? "" : " AND c.is_bot = 0"}`,
+    ).all<{
+      event_key: string;
+      login: string;
+      repo: string;
+      type: string;
+      occurred_at: string;
+      payload: string | null;
+    }>();
+    return retainRecent(all.results).map((r) => ({
+      event_key: r.event_key,
+      login: r.login,
+      repo: r.repo,
+      type: publicType(r.type),
+      occurred_at: r.occurred_at,
+      ...(r.type === "pr" && r.payload ? { draft: true } : {}),
+    }));
+  }
+
+  async function served(bots: boolean) {
+    const res = await handleStatsV3(
+      env,
+      new Request(
+        `https://oogatron.test/v2/stats${bots ? "?include_bots=1" : ""}`,
+      ),
+    );
+    return ((await res.json()) as { recent: unknown[] }).recent;
+  }
+
+  const groupReads = (prepare: { mock: { calls: unknown[][] } }) =>
+    prepare.mock.calls.filter((c) =>
+      (c[0] as string).includes("e.repo = ? AND e.contributor_id = ?"),
+    ).length;
+
+  it("serves exactly the full-history feed while reading a bounded slice", async () => {
+    await seed(0x0b0b, 120, 1, 30);
+    const prepare = vi.spyOn(env.DB, "prepare");
+    for (const bots of [false, true]) {
+      const expected = await fromHistory(bots);
+      expect(expected.length).toBeGreaterThan(50);
+      expect(await served(bots)).toEqual(expected);
+    }
+    // Some groups' newest RECENT_FETCH fell short and were read whole.
+    expect(groupReads(prepare)).toBeGreaterThan(0);
+    expect(groupReads(prepare)).toBeLessThan(80);
+  });
+
+  it("falls back to one full pass when many groups fall short", async () => {
+    await seed(0x0b0b, 600, 1, 5);
+    const prepare = vi.spyOn(env.DB, "prepare");
+    expect(await served(true)).toEqual(await fromHistory(true));
+    expect(groupReads(prepare)).toBe(0);
+    expect(
+      prepare.mock.calls.some(
+        (c) =>
+          !(c[0] as string).includes("WITH k") &&
+          /WHERE e\.counted = 1\s*$/.test(c[0] as string),
+      ),
+    ).toBe(true);
+  });
+
+  it("reads a group whole when a timestamp is not GitHub's format", async () => {
+    await seed(0x0dd, 20, 3, 40, true);
+    const prepare = vi.spyOn(env.DB, "prepare");
+    expect(await served(true)).toEqual(await fromHistory(true));
+    expect(groupReads(prepare)).toBeGreaterThan(0);
   });
 });
 

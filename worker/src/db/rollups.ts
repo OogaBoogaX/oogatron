@@ -1,10 +1,8 @@
-// Recompute counts from all history after a sync actually changed an event
-// (unchanged re-upserts count zero — see eventUpsertStatements). Keep the
-// global reconciliation rules for late arrivals, corrections and dedupe,
-// but write only changed summaries and remove keys that no longer count.
-// Both flag updates and summary reconciliation stay in one atomic D1 batch.
-// The extra grouped-key read trades some background query time for fewer
-// summary writes; raw events, refresh cadence and API reads are unchanged.
+// daily_rollups holds every counted event's (repo, day, contributor, type)
+// bucket. Since migration 0012 its triggers keep it current as events change,
+// and reconcileRollups re-evaluates only the commits whose dedupe can have
+// moved; recomputeRollups below still rebuilds both from all history, writing
+// only what differs, for migrations, cleanups and the daily drift check.
 //
 // Commit dedupe, materialized into activity_events.counted once per rebuild
 // rather than re-derived per request (as a correlated subquery it read ~160
@@ -42,8 +40,67 @@ const UNCOUNTED_IDS = `
     WHERE type = 'commit' AND json_extract(payload, '$.authoredAt') IS NOT NULL)
   WHERE rn > 1`;
 
-export async function recomputeRollups(db: D1Database): Promise<void> {
+// A commit is uncounted under either rule above, written for one row of the
+// outer UPDATE (activity_events) and answered by an index seek on each side
+// (migration 0012's idx_events_merge_commit and idx_events_commit_identity),
+// never a scan. NULL headlines share a partition, as in ROW_NUMBER, hence IS.
+// The unary + drops external_id's TEXT affinity, without which SQLite cannot
+// seek the expression index and reads every merge in the repo; mergeCommit is
+// always a JSON string or null (sync/prs.ts), so no comparison changes.
+const UNCOUNTED_ROW = `
+  EXISTS (SELECT 1 FROM activity_events m
+    WHERE m.type = 'merge' AND m.repo = activity_events.repo
+      AND json_extract(m.payload, '$.mergeCommit') = +activity_events.external_id)
+  OR (json_extract(activity_events.payload, '$.authoredAt') IS NOT NULL
+    AND EXISTS (SELECT 1 FROM activity_events d
+      WHERE d.type = 'commit' AND d.repo = activity_events.repo
+        AND d.contributor_id = activity_events.contributor_id
+        AND json_extract(d.payload, '$.authoredAt') = json_extract(activity_events.payload, '$.authoredAt')
+        AND json_extract(d.payload, '$.headline') IS json_extract(activity_events.payload, '$.headline')
+        AND (d.occurred_at > activity_events.occurred_at
+          OR (d.occurred_at = activity_events.occurred_at
+            AND d.external_id > activity_events.external_id))))`;
+
+// The commits whose flag can have moved since the last reconcile: the identity
+// groups and oids that migration 0012's triggers noted in counted_dirty.
+// CROSS JOIN keeps the few notes as the outer loop (SQLite never reorders
+// it), so each is one seek on idx_events_commit_identity or the (repo,
+// external_id) key; left to choose, the planner walks every commit instead.
+const DIRTY_COMMITS = `
+  SELECT e.id FROM counted_dirty k CROSS JOIN activity_events e
+    ON e.type = 'commit' AND e.repo = k.repo AND e.contributor_id = k.contributor_id
+   AND json_extract(e.payload, '$.authoredAt') = k.authored_at
+   AND json_extract(e.payload, '$.headline') IS k.headline
+  WHERE k.authored_at IS NOT NULL
+  UNION
+  SELECT e.id FROM counted_dirty k CROSS JOIN activity_events e
+    ON e.type = 'commit' AND e.repo = k.repo AND e.external_id = k.oid
+  WHERE k.oid IS NOT NULL`;
+
+// After a sync that wrote events. daily_rollups is already current (migration
+// 0012's triggers keep each bucket as its events change), so only the counted
+// flags of the commits noted dirty are re-evaluated, and a flag that moves
+// moves its bucket through the same triggers. Reads rows in proportion to what
+// changed, not to all history. One batch, so a failure leaves the notes for the
+// next run.
+export const RECONCILE_FLAGS = `UPDATE activity_events
+  SET counted = CASE WHEN ${UNCOUNTED_ROW} THEN 0 ELSE 1 END
+  WHERE id IN (${DIRTY_COMMITS})
+    AND counted IS NOT (CASE WHEN ${UNCOUNTED_ROW} THEN 0 ELSE 1 END)`;
+
+export async function reconcileRollups(db: D1Database): Promise<void> {
   await db.batch([
+    db.prepare(RECONCILE_FLAGS),
+    db.prepare("DELETE FROM counted_dirty"),
+  ]);
+}
+
+// Everything from all history: migrations and cleanups, and the daily check
+// that the incremental path has not drifted. Returns how many rows it changed
+// (flags and buckets, with what the triggers wrote for them), which is 0
+// whenever the incremental path kept up.
+export async function recomputeRollups(db: D1Database): Promise<number> {
+  const results = await db.batch([
     // Guarded both ways: only rows whose flag actually changes are written.
     db.prepare(
       `UPDATE activity_events SET counted = 0
@@ -74,5 +131,8 @@ export async function recomputeRollups(db: D1Database): Promise<void> {
          WHERE ${COUNTED}
          GROUP BY 1, 2, 3, 4)`,
     ),
+    // Everything is exact now, including whatever the triggers noted.
+    db.prepare("DELETE FROM counted_dirty"),
   ]);
+  return results.slice(0, 4).reduce((n, r) => n + (r.meta.changes ?? 0), 0);
 }

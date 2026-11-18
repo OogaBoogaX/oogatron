@@ -96,7 +96,7 @@ CREATE INDEX idx_events_contributor_time ON activity_events(contributor_id, occu
 CREATE INDEX idx_events_type_time        ON activity_events(type, occurred_at);
 CREATE INDEX idx_events_repo_time        ON activity_events(repo, occurred_at);
 
-CREATE TABLE daily_rollups (              -- recomputed after each sync; serves fast queries
+CREATE TABLE daily_rollups (              -- kept current by triggers (migration 0012); serves fast queries
   repo           TEXT NOT NULL DEFAULT 'entropylab',
   day            TEXT NOT NULL,           -- YYYY-MM-DD
   contributor_id INTEGER NOT NULL REFERENCES contributors(id),
@@ -176,7 +176,7 @@ CREATE TABLE repos (                      -- discovered org repos (discovery cac
   committer); mark them `is_bot = 1`. Bots are stored but **excluded from all
   API responses by default** (`?include_bots=1` overrides).
 - **Discipline:** honor GitHub's rate-limit headers with backoff; every upsert is
-  idempotent on `external_id`; recompute affected `daily_rollups` and bust the
+  idempotent on `external_id`; reconcile affected `daily_rollups` and bust the
   KV cache at the end of a successful run; record every run in `sync_runs`.
 
 ### HTTP API (versioned, frozen contract)

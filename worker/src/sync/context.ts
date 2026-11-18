@@ -49,10 +49,10 @@ export async function persistPage(
   ctx.budget.spend();
   const results = await ctx.db.batch(statements);
   // Count rows actually inserted or changed, not rows sent: overlap windows
-  // re-send unchanged events every run, and counting those would trigger a
-  // full rollup rebuild on every tick.
+  // re-send unchanged events every run, and counting those would reconcile
+  // the rollups on every tick. Each such row comes back from RETURNING.
   for (let i = eventsFrom; i < eventsTo; i++) {
-    ctx.eventsWritten += results[i].meta.changes ?? 0;
+    ctx.eventsWritten += results[i].results.length;
   }
   for (let i = 0; i < eventsFrom; i++) {
     ctx.contributorsChanged =
