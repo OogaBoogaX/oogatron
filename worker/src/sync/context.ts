@@ -15,15 +15,18 @@ export interface SyncContext {
   contributorsChanged?: number;
 }
 
-// Persists one page atomically: contributor upserts, event upserts, and the
-// sync_state cursor advance all land in a single db.batch — a crash can never
-// persist a cursor without its page's events. Costs 1 subrequest.
+// Persists one page atomically: contributor upserts, event upserts, any extra
+// event writes, and the sync_state cursor advance all land in a single
+// db.batch — a crash can never persist a cursor without its page's events.
+// An extra statement names the events it changed with RETURNING, as the
+// upserts do. Costs 1 subrequest.
 export async function persistPage(
   ctx: SyncContext,
   repo: string,
   source: string,
   events: ParsedEvent[],
   newState: unknown,
+  extra: D1PreparedStatement[] = [],
 ): Promise<void> {
   const statements: D1PreparedStatement[] = [];
   const resolved: ResolvedEvent[] = [];
@@ -40,10 +43,11 @@ export async function persistPage(
       externalId: e.externalId,
       occurredAt: e.occurredAt,
       payload: e.payload,
+      landed: e.landed,
     });
   }
   const eventsFrom = statements.length;
-  statements.push(...eventUpsertStatements(ctx.db, repo, resolved));
+  statements.push(...eventUpsertStatements(ctx.db, repo, resolved), ...extra);
   const eventsTo = statements.length;
   statements.push(syncStateUpsert(ctx.db, repo, source, newState));
   ctx.budget.spend();

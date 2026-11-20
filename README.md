@@ -67,23 +67,38 @@ Design principles, from the spec:
 
 ## How activity is counted
 
-Events are stored raw and complete; what the API *counts* is decided as events
-change and stored on each event as `activity_events.counted`, so every
-read path (rollups, the recent feed, per-contributor queries) filters on one
-flag instead of re-deriving dedupe rules per request.
+Events are stored raw and complete. Two things are decided from them, as
+events change, and stored so no read path re-derives a rule per request:
+
+- **Activity** (`activity_events.counted`): every distinct event. The recent
+  feed, each contributor's last activity per repo, and who counts as a
+  contributor at all read this. A push to a PR branch, a comment or a merge
+  is activity the moment it happens.
+- **Contributions** (`daily_rollups.tally`): what the counts and leaderboards
+  serve. Every activity event is one, except that a commit counts only once
+  it is on the default branch, as on GitHub's contribution graph
+  (`activity_events.landed`, `TALLIED` in `worker/src/db/rollups.ts`).
+
+The rules:
 
 - **Commits** come from each repo's default branch **and every PR's branch**,
-  whatever the PR's state, so work shows up as soon as it's pushed, not only
-  once it merges. Both walkers share one commit-to-event mapping
-  (`commitEvent` in `worker/src/sync/commits.ts`); a SHA reached both ways is
-  one row.
-- **Merge credit:** a merged PR is one `merge` credit for whoever pressed the
-  button, and its auto-generated merge commit is not counted.
+  whatever the PR's state, so work is activity as soon as it's pushed. Both
+  walkers share one commit-to-event mapping (`commitEvent` in
+  `worker/src/sync/commits.ts`); a SHA reached both ways is one row. A commit
+  is *landed* when the default-branch walk reaches it, or when its PR was
+  merged into the default branch with a merge commit (two parents), which
+  puts the branch's own SHAs there. A commit on a branch alone is activity, not a
+  contribution.
+- **Merges:** a merged PR is one `merge` for whoever pressed the button, its
+  own count (`merges`), not a commit. The merge commit is its author's
+  commit, as it is on GitHub.
 - **Patch identity:** a rebase merge, a rebased PR branch or an `--amend`
   leaves the same patch under several SHAs. Commits with the same repo,
-  author, author date and headline count once (the newest copy).
-- **Squash merges:** the PR's branch commits credit their authors; the squash
-  commit folds into the merge credit.
+  author, author date and headline count once: a copy on the default branch
+  before one on a branch alone, then the newest.
+- **Squash merges:** the PR's branch commits are their authors' activity; the
+  squash commit, which GitHub authors as the PR's author, is the
+  contribution.
 - **Bots** are stored under one canonical `name[bot]` login (GitHub's GraphQL
   says `dependabot` for a PR author but `dependabot[bot]` for a commit author,
   with the same account id) and excluded from responses by default.
@@ -265,6 +280,15 @@ the marker. A failure keeps it pending for a safe retry. Check health after
 deployment for recurring failures, and confirm the marker is gone before
 baking a new snapshot. Cached pre-migration responses can remain for up to
 60 seconds before that finalization; a fresh query string bypasses them.
+
+`0013_contribution_tally.sql` needs every default branch walked again, so each
+stored commit learns whether it is on the default branch (`landed`). It leaves
+a one-time `*/landed_rewalk` marker rather than deleting cursors itself: after
+any old run has finished, the new worker clears every `commits` cursor and the
+marker in one batch, so an old run cannot write a cursor back and skip a
+repository. Commits stored before the migration count as landed until their
+repository's walk finishes. Before baking a new snapshot, confirm the marker is
+gone and `/v1/health` shows each repository's `commits` back in `incremental`.
 
 A migration that deletes `sync_state` rows (as `0005` and `0008` do) makes
 those repos re-read their full history. A run that started before the

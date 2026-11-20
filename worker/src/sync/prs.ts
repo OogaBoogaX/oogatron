@@ -21,9 +21,10 @@ const REVIEW = `id state body submittedAt ${ACTOR} comments(first: 50) { ${COMME
 const COMMITS = `pageInfo { hasNextPage endCursor } nodes { commit { ${COMMIT_FIELDS} } }`;
 const PR = `
   id number title state isDraft createdAt updatedAt mergedAt additions deletions
+  baseRefName
   ${ACTOR}
   ${MERGED_BY}
-  mergeCommit { oid }
+  mergeCommit { oid parents(first: 2) { totalCount } }
   reviews(first: 50) { pageInfo { hasNextPage endCursor } nodes { ${REVIEW} } }
   comments(first: 50) { ${COMMENTS} }
   commits(first: 50) { ${COMMITS} }`;
@@ -87,11 +88,12 @@ interface GqlPr {
   createdAt: string;
   updatedAt: string;
   mergedAt: string | null;
+  baseRefName: string;
   additions: number;
   deletions: number;
   author: GqlActor | null;
   mergedBy: GqlActor | null;
-  mergeCommit: { oid: string } | null;
+  mergeCommit: { oid: string; parents: { totalCount: number } } | null;
   reviews: { pageInfo: PageInfo; nodes: GqlReview[] };
   comments: { pageInfo: PageInfo; nodes: GqlComment[] };
   commits: { pageInfo: PageInfo; nodes: Array<GqlPrCommit | null> };
@@ -108,6 +110,8 @@ export interface FollowUp {
   reviewCursor: string | null;
   commentCursor: string | null;
   commitCursor: string | null;
+  // pr_overflow commits: the PR's branch commits are on the default branch.
+  landed: boolean;
 }
 
 // GitHub auto-creates an empty-body COMMENTED "container" review for every
@@ -163,6 +167,7 @@ function reviewEvents(
       reviewCursor: null,
       commentCursor: review.comments.pageInfo.endCursor,
       commitCursor: null,
+      landed: false,
     });
   }
 }
@@ -183,21 +188,38 @@ function conversationCommentEvents(
   }
 }
 
-// Every PR's branch commits count, whatever the PR's state, so work shows up
-// as soon as it's pushed rather than when it lands. A merge-commit merge
+// Every PR's branch commits are activity, whatever the PR's state, so work
+// shows up as soon as it's pushed rather than when it lands; they count as
+// contributions once they land (db/rollups.ts TALLIED). A merge-commit merge
 // brings the same SHAs onto the default branch (one row, via the
-// UNIQUE(repo, external_id) upsert); rebases get new SHAs and are counted
-// once by the patch-identity flag in db/rollups.ts.
+// UNIQUE(repo, external_id) upsert), and they land then: the default-branch
+// walker's since window, by committed date, would never reach an old
+// branch's commits. Squash and rebase merges put new SHAs on the branch
+// instead, which that walker lands; a rebase's branch copies are counted once
+// by the patch-identity flag in db/rollups.ts.
 function branchCommitEvents(
   nodes: Array<GqlPrCommit | null>,
+  landed: boolean,
   out: ParsedEvent[],
 ): void {
   for (const n of nodes) {
-    if (n?.commit) out.push(commitEvent(n.commit));
+    if (n?.commit) out.push(commitEvent(n.commit, landed));
   }
 }
 
-export function parsePrNode(pr: GqlPr): {
+// Merged into the default branch with a merge commit (two parents), not
+// squashed or rebased. A PR merged into another PR's branch (a stacked PR)
+// lands nothing: whether its commits reach the default branch is the
+// default-branch walk's to say.
+const mergedAsIs = (pr: GqlPr, defaultBranch: string): boolean =>
+  !!pr.mergedAt &&
+  pr.baseRefName === defaultBranch &&
+  (pr.mergeCommit?.parents?.totalCount ?? 0) > 1;
+
+export function parsePrNode(
+  pr: GqlPr,
+  defaultBranch: string,
+): {
   events: ParsedEvent[];
   followUps: FollowUp[];
 } {
@@ -240,7 +262,8 @@ export function parsePrNode(pr: GqlPr): {
     reviewEvents(review, pr.number, events, followUps);
   }
   conversationCommentEvents(pr.comments.nodes, pr.number, events);
-  branchCommitEvents(pr.commits.nodes, events);
+  const landed = mergedAsIs(pr, defaultBranch);
+  branchCommitEvents(pr.commits.nodes, landed, events);
 
   if (
     pr.reviews.pageInfo.hasNextPage ||
@@ -260,6 +283,7 @@ export function parsePrNode(pr: GqlPr): {
       commitCursor: pr.commits.pageInfo.hasNextPage
         ? pr.commits.pageInfo.endCursor
         : null,
+      landed,
     });
   }
 
@@ -330,7 +354,7 @@ async function drainFollowUps(
         }
       }
       if (f.commitCursor !== null) {
-        branchCommitEvents(node.commits.nodes, events);
+        branchCommitEvents(node.commits.nodes, f.landed, events);
         if (node.commits.pageInfo.hasNextPage) {
           followUps.push({
             ...f,
@@ -394,7 +418,7 @@ export async function syncPrs(
       const followUps: FollowUp[] = [];
       let pageMax: string | null = s.maxSeen;
       for (const pr of prs) {
-        const parsed = parsePrNode(pr);
+        const parsed = parsePrNode(pr, repo.defaultBranch);
         events.push(...parsed.events);
         followUps.push(...parsed.followUps);
         pageMax = maxIso(pageMax, pr.updatedAt);
@@ -438,7 +462,7 @@ export async function syncPrs(
         sawOlder = true;
         break;
       }
-      const parsed = parsePrNode(pr);
+      const parsed = parsePrNode(pr, repo.defaultBranch);
       events.push(...parsed.events);
       followUps.push(...parsed.followUps);
       newWatermark = maxIso(newWatermark, pr.updatedAt)!;

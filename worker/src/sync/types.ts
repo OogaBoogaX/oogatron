@@ -33,6 +33,10 @@ export interface ParsedEvent {
   occurredAt: string;
   actor: ActorRef;
   payload: Record<string, unknown>;
+  // Commits only: true when the walker knows the commit is on the default
+  // branch (see db/rollups.ts TALLIED). Never in the payload, which must stay
+  // identical whichever walker reaches a SHA.
+  landed?: boolean;
 }
 
 export interface PageInfo {

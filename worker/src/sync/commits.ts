@@ -1,4 +1,4 @@
-import { COMMIT_OVERLAP_DAYS, OWNER } from "../config";
+import { COMMIT_OVERLAP_DAYS, OWNER, canonicalRepoName } from "../config";
 import { githubGraphQL } from "./github";
 import { maxIso, persistPage, type SyncContext } from "./context";
 import type { ParsedEvent, PageInfo, RepoRef } from "./types";
@@ -64,7 +64,7 @@ export function parseCommitsPage(data: Record<string, unknown>): {
     (n): n is CommitNode => n !== null,
   )) {
     maxSeen = maxIso(maxSeen, node.committedDate);
-    events.push(commitEvent(node));
+    events.push(commitEvent(node, true));
   }
   return { events, pageInfo: history.pageInfo as PageInfo, maxSeen };
 }
@@ -75,7 +75,8 @@ export function parseCommitsPage(data: Record<string, unknown>): {
 // flip the row on every run and force a rollup rebuild each tick.
 // authoredAt (with the headline) is the patch identity the rollup rebuild
 // uses to count a rebased or amended commit once (see db/rollups.ts).
-export function commitEvent(node: CommitNode): ParsedEvent {
+// landed says whether the walker knows the default branch holds it.
+export function commitEvent(node: CommitNode, landed: boolean): ParsedEvent {
   const user = node.author?.user ?? null;
   return {
     type: "commit",
@@ -93,7 +94,21 @@ export function commitEvent(node: CommitNode): ParsedEvent {
       headline: node.messageHeadline,
       authoredAt: node.author?.date ?? null,
     },
+    landed,
   };
+}
+
+// A whole default-branch walk has now reached every commit the branch holds,
+// so a commit stored before migration 0013 that it did not reach (landed still
+// NULL) is on a PR branch alone.
+function settleLanded(ctx: SyncContext, repo: RepoRef): D1PreparedStatement {
+  return ctx.db
+    .prepare(
+      `UPDATE activity_events SET landed = 0
+       WHERE repo = ? AND type = 'commit' AND landed IS NULL
+       RETURNING id`,
+    )
+    .bind(canonicalRepoName(repo.name));
 }
 
 export async function syncCommits(
@@ -129,7 +144,9 @@ export async function syncCommits(
           phase: "incremental",
           since: newMax ?? new Date(0).toISOString(),
         };
-        await persistPage(ctx, repo.name, "commits", events, s);
+        await persistPage(ctx, repo.name, "commits", events, s, [
+          settleLanded(ctx, repo),
+        ]);
         return true;
       }
     }

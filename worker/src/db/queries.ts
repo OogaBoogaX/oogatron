@@ -7,6 +7,7 @@ export interface ResolvedEvent {
   externalId: string;
   occurredAt: string;
   payload: Record<string, unknown>;
+  landed?: boolean;
 }
 
 // The DO UPDATE is guarded so re-upserting an unchanged event (incremental
@@ -15,8 +16,11 @@ export interface ResolvedEvent {
 // reconcile. RETURNING names exactly the events inserted or changed;
 // meta.changes would also count what migration 0012's triggers write.
 //
+// landed only ever rises: a walker that reaches a commit from a PR branch
+// knows nothing about whether the default branch holds it too.
+//
 // Multi-row upserts chunked to stay well under D1's ~100 bound-parameter
-// limit per statement (6 params per row).
+// limit per statement (7 params per row).
 const EVENT_CHUNK = 10;
 
 export function eventUpsertStatements(
@@ -30,7 +34,8 @@ export function eventUpsertStatements(
     const chunk = events.slice(i, i + EVENT_CHUNK);
     const values = chunk
       .map(
-        () => "(?, (SELECT id FROM contributors WHERE login = ?), ?, ?, ?, ?)",
+        () =>
+          "(?, (SELECT id FROM contributors WHERE login = ?), ?, ?, ?, ?, ?)",
       )
       .join(", ");
     const params = chunk.flatMap((e) => [
@@ -40,19 +45,22 @@ export function eventUpsertStatements(
       e.externalId,
       e.occurredAt,
       JSON.stringify(e.payload),
+      e.landed ? 1 : 0,
     ]);
     statements.push(
       db
         .prepare(
-          `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload)
+          `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload, landed)
            VALUES ${values}
            ON CONFLICT(repo, external_id) DO UPDATE SET
              contributor_id = excluded.contributor_id,
              occurred_at    = excluded.occurred_at,
-             payload        = excluded.payload
+             payload        = excluded.payload,
+             landed         = CASE WHEN excluded.landed = 1 THEN 1 ELSE activity_events.landed END
            WHERE contributor_id IS NOT excluded.contributor_id
               OR occurred_at    IS NOT excluded.occurred_at
               OR payload        IS NOT excluded.payload
+              OR (excluded.landed = 1 AND activity_events.landed IS NOT 1)
            RETURNING id`,
         )
         .bind(...params),
