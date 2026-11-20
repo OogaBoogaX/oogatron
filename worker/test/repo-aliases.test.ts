@@ -197,7 +197,13 @@ describe("Lightning Foundry repository identity", () => {
         last_checked_at: "2026-10-02",
       },
     ]);
-    expect(after[3].filter((r) => r.source !== "foundry_cleanup")).toEqual([
+    // The markers apart: 0009's, and 0013's re-walk, which a fresh test
+    // database holds from setup.
+    expect(
+      after[3].filter(
+        (r) => r.source !== "foundry_cleanup" && r.source !== "landed_rewalk",
+      ),
+    ).toEqual([
       {
         repo: "bananapayserver",
         source: "commits",

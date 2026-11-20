@@ -146,6 +146,24 @@ export async function runSync(
         .run();
     }
 
+    // 0013 asks for every default branch to be walked again, so each stored
+    // commit learns whether it landed. An old invocation could write its
+    // commits cursor back after the migration, so the cursors are cleared
+    // here, after it is gone, with the marker in the same batch.
+    const rewalk = await db
+      .prepare(
+        "SELECT 1 FROM sync_state WHERE repo = '*' AND source = 'landed_rewalk'",
+      )
+      .first();
+    if (rewalk) {
+      await db.batch([
+        db.prepare("DELETE FROM sync_state WHERE source = 'commits'"),
+        db.prepare(
+          "DELETE FROM sync_state WHERE repo = '*' AND source = 'landed_rewalk'",
+        ),
+      ]);
+    }
+
     ctx = {
       env,
       db,

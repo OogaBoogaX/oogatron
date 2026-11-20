@@ -446,6 +446,13 @@ describe("default-branch re-walk after migration 0013", () => {
       env.DB.prepare(
         "INSERT INTO contributors (id, login, github_id, is_bot) VALUES (1, 'alice', 1001, 0)",
       ),
+      // An old invocation still running when the migration applied wrote its
+      // incremental cursor back; the migration's marker still stands.
+      env.DB.prepare(
+        `INSERT INTO sync_state (repo, source, cursor, updated_at) VALUES
+         ('entropylab', 'commits', '{"phase":"incremental","since":"2026-01-07T12:00:00Z"}', '2026-01-08')
+         ON CONFLICT(repo, source) DO UPDATE SET cursor = excluded.cursor`,
+      ),
       env.DB.prepare(
         `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload, landed) VALUES
          ('entropylab', 1, 'commit', 'cccccccccccccccccccccccccccccccccccccc01', '2025-12-01T00:00:00Z', '{}', NULL),
@@ -471,6 +478,12 @@ describe("default-branch re-walk after migration 0013", () => {
       "SELECT count, tally FROM daily_rollups WHERE day = '2025-12-01' AND type = 'commit'",
     ).first();
     expect(stale).toEqual({ count: 1, tally: 0 });
+    // The marker is spent; the next run walks incrementally.
+    expect(
+      await env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM sync_state WHERE source = 'landed_rewalk'",
+      ).first("n"),
+    ).toBe(0);
   });
 });
 
@@ -716,6 +729,11 @@ describe("stale-run guard", () => {
   it("records initialization failures and recovers on the next attempt", async () => {
     const now = new Date().toISOString();
     await env.DB.batch([
+      // Migration 0013's one-time re-walk would clear the cursor this test
+      // follows; it has its own test above.
+      env.DB.prepare(
+        "DELETE FROM sync_state WHERE repo = '*' AND source = 'landed_rewalk'",
+      ),
       env.DB.prepare(
         `INSERT INTO sync_runs (kind, started_at, finished_at, status, detail)
          VALUES ('incremental', ?, ?, 'ok', '{"trigger":"cron"}')`,

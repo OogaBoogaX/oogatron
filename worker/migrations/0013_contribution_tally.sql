@@ -137,4 +137,11 @@ BEGIN
 END;
 
 -- Re-walk every default branch so each stored commit learns whether it landed.
-DELETE FROM sync_state WHERE source = 'commits';
+-- An old Worker invocation still running when this applies would write its
+-- incremental commits cursor back, and that repo would never be re-walked, so
+-- its pre-migration branch-only commits would keep landed NULL and count for
+-- good. The reset happens in src/sync/run.ts behind this marker instead, once
+-- no older run is active, as 0009's foundry_cleanup does.
+INSERT INTO sync_state (repo, source, cursor, updated_at)
+VALUES ('*', 'landed_rewalk', 'true', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+ON CONFLICT(repo, source) DO NOTHING;

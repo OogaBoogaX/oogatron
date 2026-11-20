@@ -281,6 +281,15 @@ deployment for recurring failures, and confirm the marker is gone before
 baking a new snapshot. Cached pre-migration responses can remain for up to
 60 seconds before that finalization; a fresh query string bypasses them.
 
+`0013_contribution_tally.sql` needs every default branch walked again, so each
+stored commit learns whether it is on the default branch (`landed`). It leaves
+a one-time `*/landed_rewalk` marker rather than deleting cursors itself: after
+any old run has finished, the new worker clears every `commits` cursor and the
+marker in one batch, so an old run cannot write a cursor back and skip a
+repository. Commits stored before the migration count as landed until their
+repository's walk finishes. Before baking a new snapshot, confirm the marker is
+gone and `/v1/health` shows each repository's `commits` back in `incremental`.
+
 A migration that deletes `sync_state` rows (as `0005` and `0008` do) makes
 those repos re-read their full history. A run that started before the
 migration can write its old cursors back afterward, silently skipping the
