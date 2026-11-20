@@ -15,7 +15,9 @@ ALTER TABLE daily_rollups ADD COLUMN tally INTEGER NOT NULL DEFAULT 0;
 
 -- The merge rule leaves the commit dedupe: a merge commit (or a squash merge's
 -- one commit) on the default branch is its author's commit, as on GitHub, and
--- the merge itself is its own kind, outside the contribution total.
+-- the merge itself is its own kind, outside the contribution total. Of a
+-- patch's copies, a landed one now counts before one on a branch alone (see
+-- src/db/rollups.ts), so a change of landed is a dedupe input too.
 DROP TRIGGER rollups_event_insert;
 DROP TRIGGER rollups_event_delete;
 DROP TRIGGER rollups_event_update;
@@ -31,7 +33,7 @@ UPDATE activity_events SET counted = 0 WHERE counted = 1 AND id IN (
     SELECT id, ROW_NUMBER() OVER (
       PARTITION BY repo, contributor_id,
         json_extract(payload, '$.authoredAt'), json_extract(payload, '$.headline')
-      ORDER BY occurred_at DESC, external_id DESC) AS rn
+      ORDER BY landed IS NOT 0 DESC, occurred_at DESC, external_id DESC) AS rn
     FROM activity_events
     WHERE type = 'commit' AND json_extract(payload, '$.authoredAt') IS NOT NULL)
   WHERE rn > 1);
@@ -40,7 +42,7 @@ UPDATE activity_events SET counted = 1 WHERE counted = 0 AND id NOT IN (
     SELECT id, ROW_NUMBER() OVER (
       PARTITION BY repo, contributor_id,
         json_extract(payload, '$.authoredAt'), json_extract(payload, '$.headline')
-      ORDER BY occurred_at DESC, external_id DESC) AS rn
+      ORDER BY landed IS NOT 0 DESC, occurred_at DESC, external_id DESC) AS rn
     FROM activity_events
     WHERE type = 'commit' AND json_extract(payload, '$.authoredAt') IS NOT NULL)
   WHERE rn > 1);
@@ -103,7 +105,7 @@ BEGIN
 END;
 
 -- Dedupe inputs: a commit's own identity, before and after an edit, so a
--- commit leaving a group frees the copy it hid.
+-- commit leaving a group frees the copy it hid, and its landed flag.
 CREATE TRIGGER counted_dirty_insert AFTER INSERT ON activity_events
 WHEN NEW.type = 'commit'
 BEGIN
@@ -121,7 +123,7 @@ BEGIN
 END;
 
 CREATE TRIGGER counted_dirty_update
-AFTER UPDATE OF repo, contributor_id, type, external_id, occurred_at, payload ON activity_events
+AFTER UPDATE OF repo, contributor_id, type, external_id, occurred_at, payload, landed ON activity_events
 WHEN OLD.type = 'commit' OR NEW.type = 'commit'
 BEGIN
   INSERT INTO counted_dirty (repo, contributor_id, authored_at, headline, oid)

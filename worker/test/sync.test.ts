@@ -387,7 +387,7 @@ describe("parsePrNode branch commits", () => {
   ) as any[];
 
   it("maps branch commits exactly as the default-branch walk does", () => {
-    const fromBranch = parsePrNode(prs[0]).events.filter(
+    const fromBranch = parsePrNode(prs[0], "rock").events.filter(
       (e) => e.type === "commit",
     );
     const fromHistory = parseCommitsPage(
@@ -408,7 +408,7 @@ describe("parsePrNode branch commits", () => {
         pageInfo: { hasNextPage: true, endCursor: "commit-cursor-1" },
       },
     };
-    expect(parsePrNode(pr).followUps).toEqual([
+    expect(parsePrNode(pr, "rock").followUps).toEqual([
       {
         kind: "pr_overflow",
         nodeId: "PR_kwDOtest0002",
@@ -421,9 +421,9 @@ describe("parsePrNode branch commits", () => {
     ]);
   });
 
-  it("lands a PR's branch commits only when it was merged with a merge commit", () => {
+  it("lands a PR's branch commits only when merged into the default branch with a merge commit", () => {
     const landed = (pr: any) =>
-      parsePrNode(pr)
+      parsePrNode(pr, "rock")
         .events.filter((e) => e.type === "commit")
         .map((e) => e.landed);
     expect(landed(prs[0])).toEqual([true]);
@@ -432,6 +432,9 @@ describe("parsePrNode branch commits", () => {
       mergeCommit: { ...prs[0].mergeCommit, parents: { totalCount: 1 } },
     };
     expect(landed(squashed)).toEqual([false]);
+    // A stacked PR merged into another PR's branch: its commits are not on
+    // the default branch, whatever the merge.
+    expect(landed({ ...prs[0], baseRefName: "feat/base" })).toEqual([false]);
     expect(landed(prs[1])).toEqual([false]); // still open
   });
 });

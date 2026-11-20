@@ -152,11 +152,11 @@ CREATE TABLE repos (                      -- discovered org repos (discovery cac
     state (open, merged, closed), so work is activity as soon as it's pushed.
     Deduped by SHA (a merge-commit merge brings the same SHAs to the default
     branch) and by patch identity — same repo, author, author date and headline
-    counts once, newest copy kept — which absorbs rebase merges, rebased PR
-    branches and amends. A commit counts as a contribution (`daily_rollups.
+    counts once, a landed copy kept before a branch-only one, then the newest —
+    which absorbs rebase merges, rebased PR branches, amends and cherry-picks. A commit counts as a contribution (`daily_rollups.
     tally`) only once it is on the default branch (`activity_events.landed`:
-    the default-branch walk reached it, or its PR merged with a two-parent
-    merge commit), as on GitHub's contribution graph; every one is activity
+    the default-branch walk reached it, or its PR merged into the default
+    branch with a two-parent merge commit), as on GitHub's contribution graph; every one is activity
     (`counted`, `daily_rollups.count`). Attribute by the commit author's linked GitHub
     user; when a commit has no linked user, match by author email against known
     contributors, else create an unmatched contributor row keyed by a hash of the

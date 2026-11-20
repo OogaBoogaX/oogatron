@@ -7,11 +7,13 @@
 //
 // Commit dedupe, materialized into activity_events.counted once per rebuild
 // rather than re-derived per request (as a correlated subquery it read ~160
-// rows per event on every stats cache miss). A commit is uncounted when a
-// newer commit in the same repo has the same author, author date and headline
-// (its patch identity). PR branches are walked too (sync/prs.ts), so a rebase
-// merge, a rebased PR branch or an --amend leaves the same patch under several
-// SHAs; only the newest counts.
+// rows per event on every stats cache miss). A commit is uncounted when
+// another commit in the same repo has the same author, author date and
+// headline (its patch identity) and outranks it. PR branches are walked too
+// (sync/prs.ts), so a rebase merge, a rebased PR branch or an --amend leaves
+// the same patch under several SHAs; one counts: a landed copy before one on a
+// branch alone (so a commit on the default branch, cherry-picked onto a PR
+// branch later, keeps counting), then the newest.
 //
 // Every counted event is activity: the recent feed, each pair's last activity
 // and daily_rollups.count. Raw events stay complete for audit; rollups and
@@ -34,7 +36,7 @@ const UNCOUNTED_IDS = `
     SELECT id, ROW_NUMBER() OVER (
       PARTITION BY repo, contributor_id,
         json_extract(payload, '$.authoredAt'), json_extract(payload, '$.headline')
-      ORDER BY occurred_at DESC, external_id DESC) AS rn
+      ORDER BY landed IS NOT 0 DESC, occurred_at DESC, external_id DESC) AS rn
     FROM activity_events
     WHERE type = 'commit' AND json_extract(payload, '$.authoredAt') IS NOT NULL)
   WHERE rn > 1`;
@@ -42,7 +44,7 @@ const UNCOUNTED_IDS = `
 // The rule above, written for one row of the outer UPDATE (activity_events)
 // and answered by an index seek on idx_events_commit_identity (migration
 // 0012), never a scan. NULL headlines share a partition, as in ROW_NUMBER,
-// hence IS.
+// hence IS; d outranks the row as ROW_NUMBER's ORDER BY ranks them.
 const UNCOUNTED_ROW = `
   (json_extract(activity_events.payload, '$.authoredAt') IS NOT NULL
     AND EXISTS (SELECT 1 FROM activity_events d
@@ -50,9 +52,11 @@ const UNCOUNTED_ROW = `
         AND d.contributor_id = activity_events.contributor_id
         AND json_extract(d.payload, '$.authoredAt') = json_extract(activity_events.payload, '$.authoredAt')
         AND json_extract(d.payload, '$.headline') IS json_extract(activity_events.payload, '$.headline')
-        AND (d.occurred_at > activity_events.occurred_at
-          OR (d.occurred_at = activity_events.occurred_at
-            AND d.external_id > activity_events.external_id))))`;
+        AND ((d.landed IS NOT 0) > (activity_events.landed IS NOT 0)
+          OR ((d.landed IS NOT 0) = (activity_events.landed IS NOT 0)
+            AND (d.occurred_at > activity_events.occurred_at
+              OR (d.occurred_at = activity_events.occurred_at
+                AND d.external_id > activity_events.external_id))))))`;
 
 // The commits whose flag can have moved since the last reconcile: the identity
 // groups and oids that migration 0013's triggers noted in counted_dirty.

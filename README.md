@@ -86,15 +86,16 @@ The rules:
   walkers share one commit-to-event mapping (`commitEvent` in
   `worker/src/sync/commits.ts`); a SHA reached both ways is one row. A commit
   is *landed* when the default-branch walk reaches it, or when its PR was
-  merged with a merge commit (two parents), which puts the branch's own SHAs
-  on the default branch. A commit on a branch alone is activity, not a
+  merged into the default branch with a merge commit (two parents), which
+  puts the branch's own SHAs there. A commit on a branch alone is activity, not a
   contribution.
 - **Merges:** a merged PR is one `merge` for whoever pressed the button, its
   own count (`merges`), not a commit. The merge commit is its author's
   commit, as it is on GitHub.
 - **Patch identity:** a rebase merge, a rebased PR branch or an `--amend`
   leaves the same patch under several SHAs. Commits with the same repo,
-  author, author date and headline count once (the newest copy).
+  author, author date and headline count once: a copy on the default branch
+  before one on a branch alone, then the newest.
 - **Squash merges:** the PR's branch commits are their authors' activity; the
   squash commit, which GitHub authors as the PR's author, is the
   contribution.

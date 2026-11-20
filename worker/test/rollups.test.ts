@@ -275,6 +275,47 @@ describe("patch-identity dedupe", () => {
     expect(await counted()).toEqual(["other-1", "rebased-1"]);
   });
 
+  it("keeps a landed copy counting when the patch is cherry-picked onto a branch later", async () => {
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO contributors (id, login, is_bot) VALUES (1, 'alice', 0)",
+      ),
+      // On rock, then cherry-picked onto an open PR's branch: same author,
+      // author date and headline, a newer committer date.
+      commit(
+        "on-rock",
+        "2026-02-01T10:00:00Z",
+        "2026-02-01T10:00:00Z",
+        "fix: z",
+        1,
+      ),
+      commit(
+        "picked",
+        "2026-02-05T10:00:00Z",
+        "2026-02-01T10:00:00Z",
+        "fix: z",
+        0,
+      ),
+    ]);
+    await recomputeRollups(env.DB);
+    expect(await counted()).toEqual(["on-rock"]);
+    const tally = () =>
+      env.DB.prepare(
+        "SELECT SUM(tally) AS n FROM daily_rollups WHERE type = 'commit'",
+      ).first("n");
+    expect(await tally()).toBe(1);
+
+    // The branch copy lands too (its PR merged as-is): now the newest landed
+    // copy counts, through the incremental path as through a rebuild.
+    await env.DB.prepare(
+      "UPDATE activity_events SET landed = 1 WHERE external_id = 'picked'",
+    ).run();
+    await reconcileRollups(env.DB);
+    expect(await counted()).toEqual(["picked"]);
+    expect(await tally()).toBe(1);
+    expect(await recomputeRollups(env.DB)).toBe(0);
+  });
+
   it("squash: branch commits are activity, the squash commit is the contribution", async () => {
     await env.DB.batch([
       env.DB.prepare(

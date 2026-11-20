@@ -21,6 +21,7 @@ const REVIEW = `id state body submittedAt ${ACTOR} comments(first: 50) { ${COMME
 const COMMITS = `pageInfo { hasNextPage endCursor } nodes { commit { ${COMMIT_FIELDS} } }`;
 const PR = `
   id number title state isDraft createdAt updatedAt mergedAt additions deletions
+  baseRefName
   ${ACTOR}
   ${MERGED_BY}
   mergeCommit { oid parents(first: 2) { totalCount } }
@@ -87,6 +88,7 @@ interface GqlPr {
   createdAt: string;
   updatedAt: string;
   mergedAt: string | null;
+  baseRefName: string;
   additions: number;
   deletions: number;
   author: GqlActor | null;
@@ -205,11 +207,19 @@ function branchCommitEvents(
   }
 }
 
-// Merged with a merge commit (two parents), not squashed or rebased.
-const mergedAsIs = (pr: GqlPr): boolean =>
-  !!pr.mergedAt && (pr.mergeCommit?.parents?.totalCount ?? 0) > 1;
+// Merged into the default branch with a merge commit (two parents), not
+// squashed or rebased. A PR merged into another PR's branch (a stacked PR)
+// lands nothing: whether its commits reach the default branch is the
+// default-branch walk's to say.
+const mergedAsIs = (pr: GqlPr, defaultBranch: string): boolean =>
+  !!pr.mergedAt &&
+  pr.baseRefName === defaultBranch &&
+  (pr.mergeCommit?.parents?.totalCount ?? 0) > 1;
 
-export function parsePrNode(pr: GqlPr): {
+export function parsePrNode(
+  pr: GqlPr,
+  defaultBranch: string,
+): {
   events: ParsedEvent[];
   followUps: FollowUp[];
 } {
@@ -252,7 +262,7 @@ export function parsePrNode(pr: GqlPr): {
     reviewEvents(review, pr.number, events, followUps);
   }
   conversationCommentEvents(pr.comments.nodes, pr.number, events);
-  const landed = mergedAsIs(pr);
+  const landed = mergedAsIs(pr, defaultBranch);
   branchCommitEvents(pr.commits.nodes, landed, events);
 
   if (
@@ -408,7 +418,7 @@ export async function syncPrs(
       const followUps: FollowUp[] = [];
       let pageMax: string | null = s.maxSeen;
       for (const pr of prs) {
-        const parsed = parsePrNode(pr);
+        const parsed = parsePrNode(pr, repo.defaultBranch);
         events.push(...parsed.events);
         followUps.push(...parsed.followUps);
         pageMax = maxIso(pageMax, pr.updatedAt);
@@ -452,7 +462,7 @@ export async function syncPrs(
         sawOlder = true;
         break;
       }
-      const parsed = parsePrNode(pr);
+      const parsed = parsePrNode(pr, repo.defaultBranch);
       events.push(...parsed.events);
       followUps.push(...parsed.followUps);
       newWatermark = maxIso(newWatermark, pr.updatedAt)!;

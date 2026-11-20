@@ -17,6 +17,7 @@
             "createdAt": "2026-01-08T09:00:00Z",
             "updatedAt": "2026-01-10T09:00:00Z",
             "mergedAt": "2026-01-10T09:00:00Z",
+            "baseRefName": "rock",
             "additions": 120,
             "deletions": 8,
             "author": {
@@ -164,6 +165,7 @@
             "createdAt": "2026-01-11T09:00:00Z",
             "updatedAt": "2026-01-12T09:00:00Z",
             "mergedAt": null,
+            "baseRefName": "rock",
             "additions": 55,
             "deletions": 0,
             "author": null,
