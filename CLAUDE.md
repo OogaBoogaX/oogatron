@@ -149,23 +149,24 @@ CREATE TABLE repos (                      -- discovered org repos (discovery cac
 - **What to collect** (commits walk each repo's default branch **and every
   PR's branch**):
   - `commit` — default-branch history plus the branch commits of every PR, any
-    state (open, merged, closed), so work counts as soon as it's pushed.
+    state (open, merged, closed), so work is activity as soon as it's pushed.
     Deduped by SHA (a merge-commit merge brings the same SHAs to the default
     branch) and by patch identity — same repo, author, author date and headline
     counts once, newest copy kept — which absorbs rebase merges, rebased PR
-    branches and amends. Attribute by the commit author's linked GitHub
+    branches and amends. A commit counts as a contribution (`daily_rollups.
+    tally`) only once it is on the default branch (`activity_events.landed`:
+    the default-branch walk reached it, or its PR merged with a two-parent
+    merge commit), as on GitHub's contribution graph; every one is activity
+    (`counted`, `daily_rollups.count`). Attribute by the commit author's linked GitHub
     user; when a commit has no linked user, match by author email against known
     contributors, else create an unmatched contributor row keyed by a hash of the
     email (never store the raw email in `login`).
   - `pr` — all pull requests, any state, by author.
   - `review` — review submissions on every PR, by reviewer.
   - `merge` — every merged PR, credited to `mergedBy` (whoever pressed the
-    button). The payload records the PR's `mergeCommit` oid; rollups exclude
-    that auto-generated commit so a merge is exactly one credit. For squash
-    merges the squash commit is excluded while the PR's branch commits still
-    credit their authors; for rebase merges the last rebased commit folds into
-    the merge credit (an accepted, documented rule). Both exclusions are
-    materialized into `activity_events.counted` at rollup time.
+    button), served as its own `merges` count. The merge commit (or a squash
+    merge's one commit) is its author's commit, as on GitHub; the payload's
+    `mergeCommit` oid is kept for audit.
   - `issue` — opening an issue, credited to its author (the issues walker
     sees every issue node anyway, so the event rides along with its comments).
   - `comment_issue` / `comment_review` / `comment_commit` — the three GitHub
@@ -190,22 +191,23 @@ never need lockstep deploys:
 
 - `GET /v1/stats` — **schema_version 2**, the pre-comments contract, kept
   byte-shaped for older site builds: org `totals`/`leaderboards {commits,prs,
-  reviews}`/`contributors` + `repos [{name, totals, weekly}]`. Merges fold
-  into commits (deduped); comment activity is invisible here, including in
-  the active-contributor counts.
+  reviews}`/`contributors` + `repos [{name, totals, weekly}]`. Commits are
+  default-branch commits; merges and comment activity are invisible here,
+  including in the active-contributor counts.
 - `GET /v2/stats` — **schema_version 3**, the snapshot format and what the
-  island consumes: adds `comments` and `issues` to every totals/weekly/counts
-  block and `comments` and `issues` leaderboards; each
-  `repos[]` entry gains `last_activity_at` (the jumbotron hides repos idle
-  >7 days), its own per-repo `leaderboards {commits,prs,reviews,comments,issues}`,
+  island consumes: adds `comments`, `issues` and `merges` to every
+  totals/weekly/counts block and `comments`, `issues` and `merges`
+  leaderboards; `totals.contributors` counts everyone with tracked activity;
+  each `repos[]` entry gains `last_activity_at` (the jumbotron hides repos idle
+  >7 days), its own per-repo `leaderboards {commits,prs,reviews,comments,issues,merges}`,
   and `contributors [{login, last_seen_at}]` — per-repo last activity, which
   is what routes each island Ooga to the cave of the repo they contributed
   to; plus `recent` — the newest `RECENT_DEPTH` (10, `worker/src/config.ts`)
   events **per (repo, contributor, type) cell**, plus complete first-ten
   60-second windows for every public-type subset per (repo, contributor), ordered
   newest-first, as `[{login, repo, type:
-  commit|pr|review|merge|issue|comment, occurred_at, event_key}]`, merge-commit-deduped
-  and bot-filtered. The per-cell depth is what lets the island filter the
+  commit|pr|review|merge|issue|comment, occurred_at, event_key}]`, every
+  activity event (patch-deduped, a branch push included) and bot-filtered. The per-cell depth is what lets the island filter the
   feed client-side by any combination of repos, contributors and types and
   still show its 10 newest rows (a selection is a union of cells, and an
   event among a union's newest N is among its own cell's newest N). A `pr`

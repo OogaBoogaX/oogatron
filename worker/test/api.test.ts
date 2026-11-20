@@ -11,8 +11,8 @@ import orgRepos from "./fixtures/graphql/org-repos.json";
 const BASE = "https://oogatron.test";
 
 // Events seeded raw, rollups derived through the real recompute so the API
-// tests exercise the merge-commit dedupe exactly as production does: e2 is
-// the merge's mergeCommit and must vanish from every served number.
+// tests count exactly as production does: e2 is the merge's mergeCommit, so
+// alice's commit on the default branch, while erik's merge is its own kind.
 async function seed(): Promise<void> {
   await env.DB.batch([
     env.DB.prepare(
@@ -95,17 +95,15 @@ describe("/v1/stats (schema 2, comments invisible)", () => {
     expect(body.meta).toMatchObject({ org: "OogaBoogaX", schema_version: 2 });
     expect(body.totals).toEqual({
       contributors: 2,
-      commits: 2, // e1 + erik's merge; e2 deduped away, bot e6 excluded
+      commits: 2, // e1 + e2; erik's merge is not a commit, bot e6 excluded
       prs: 1,
       reviews: 1,
     });
     expect(body.totals.comments).toBeUndefined();
     expect(body.totals.issues).toBeUndefined();
-    expect(body.leaderboards.commits).toEqual([
-      { login: "alice", count: 1 },
-      { login: "erik", count: 1 },
-    ]);
+    expect(body.leaderboards.commits).toEqual([{ login: "alice", count: 2 }]);
     expect(body.leaderboards.comments).toBeUndefined();
+    expect(body.leaderboards.merges).toBeUndefined();
     // bedrock's only erik activity is a comment -> invisible to v2.
     expect(body.repos.map((r: any) => r.name)).toEqual([
       "entropylab",
@@ -128,7 +126,7 @@ describe("/v1/stats (schema 2, comments invisible)", () => {
 });
 
 describe("/v2/stats (schema 3)", () => {
-  it("serves comments, merges-as-commits, per-repo leaderboards, last activity, and the recent feed", async () => {
+  it("serves comments, merges, per-repo leaderboards, last activity, and the recent feed", async () => {
     await seed();
     const res = await SELF.fetch(`${BASE}/v2/stats`);
     expect(res.status).toBe(200);
@@ -142,7 +140,9 @@ describe("/v2/stats (schema 3)", () => {
       reviews: 1,
       issues: 1,
       comments: 2,
+      merges: 1,
     });
+    expect(body.leaderboards.merges).toEqual([{ login: "erik", count: 1 }]);
     expect(body.leaderboards.comments).toEqual([
       { login: "alice", count: 1 },
       { login: "erik", count: 1 },
@@ -159,10 +159,13 @@ describe("/v2/stats (schema 3)", () => {
       reviews: 1,
       issues: 0,
       comments: 1,
+      merges: 1,
     });
     expect(body.repos[0].last_activity_at).toBe("2026-01-13T08:00:00Z");
     expect(body.repos[0].leaderboards.commits).toEqual([
-      { login: "alice", count: 1 },
+      { login: "alice", count: 2 },
+    ]);
+    expect(body.repos[0].leaderboards.merges).toEqual([
       { login: "erik", count: 1 },
     ]);
     // erik's bedrock comment counts in v3: repo contributors = 2.
@@ -173,6 +176,7 @@ describe("/v2/stats (schema 3)", () => {
       reviews: 0,
       issues: 1,
       comments: 1,
+      merges: 0,
     });
     expect(body.repos[1].last_activity_at).toBe("2026-01-13T10:00:00Z");
     // Per-repo contributor activity: what routes each Ooga to its repo's cave.
@@ -189,7 +193,7 @@ describe("/v2/stats (schema 3)", () => {
       { login: "erik", last_seen_at: "2026-01-13T09:00:00Z" },
     ]);
     // Membership is guaranteed to align with each repo's contributor total
-    // (both sides apply the same merge-commit exclusion) — the island's
+    // (both are every pair with tracked activity) — the island's
     // baked-snapshot integrity check relies on this invariant.
     for (const repo of body.repos) {
       expect(repo.contributors.length, repo.name).toBe(
@@ -206,9 +210,9 @@ describe("/v2/stats (schema 3)", () => {
       { login: "alice", count: 1 },
     ]);
 
-    // Recent: newest first, bot-filtered, merge commit deduped, comment
-    // surfaces folded to "comment", merges labelled as merges, draft PRs
-    // flagged from their payload.
+    // Recent: newest first, bot-filtered, comment surfaces folded to
+    // "comment", merges labelled as merges, draft PRs flagged from their
+    // payload.
     expect(
       body.recent.map((r: any) => [r.login, r.repo, r.type, r.draft]),
     ).toEqual([
@@ -216,18 +220,20 @@ describe("/v2/stats (schema 3)", () => {
       ["erik", "bedrock", "comment", undefined],
       ["alice", "entropylab", "comment", undefined],
       ["erik", "entropylab", "merge", undefined],
+      ["alice", "entropylab", "commit", undefined],
       ["erik", "entropylab", "review", undefined],
       ["alice", "bedrock", "pr", true],
       ["alice", "entropylab", "commit", undefined],
     ]);
-    expect(body.recent).toHaveLength(7);
+    expect(body.recent).toHaveLength(8);
 
     expect(body.contributors[0].counts).toEqual({
-      commits: 1,
+      commits: 2,
       prs: 1,
       reviews: 0,
       issues: 1,
       comments: 1,
+      merges: 0,
     });
     expect(body.contributors[0].login).toBe("alice");
   });
@@ -326,6 +332,35 @@ describe("/v2/stats (schema 3)", () => {
   });
 });
 
+describe("activity and contributions", () => {
+  it("serves a commit on a PR branch alone as activity, not a contribution", async () => {
+    await seed();
+    await env.DB.prepare(
+      `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload, landed)
+       VALUES ('bedrock', 1, 'commit', 'branch-1', '2026-01-14T10:00:00Z', NULL, 0)`,
+    ).run();
+    const body = (await (await SELF.fetch(`${BASE}/v2/stats`)).json()) as any;
+    const bedrock = body.repos.find((r: any) => r.name === "bedrock");
+    expect(bedrock.totals.commits).toBe(0);
+    expect(bedrock.leaderboards.commits).toEqual([]);
+    expect(body.totals.commits).toBe(2);
+    // Still activity: the island routes alice to bedrock from it, and the
+    // feed shows the push.
+    expect(
+      bedrock.contributors.find((c: any) => c.login === "alice").last_seen_at,
+    ).toBe("2026-01-14T10:00:00Z");
+    expect(body.recent[0]).toMatchObject({
+      login: "alice",
+      repo: "bedrock",
+      type: "commit",
+    });
+    const alice = (await (
+      await SELF.fetch(`${BASE}/v1/contributors/alice?type=commit`)
+    ).json()) as any;
+    expect(alice.counts.commits).toBe(2);
+  });
+});
+
 describe("/v1/contributors", () => {
   it("returns the roster without weekly", async () => {
     await seed();
@@ -335,12 +370,12 @@ describe("/v1/contributors", () => {
     expect(body.contributors[0].counts).toBeDefined();
   });
 
-  it("serves one contributor with from/to/type filters, merge-deduped", async () => {
+  it("serves one contributor with from/to/type filters", async () => {
     await seed();
     const all = (await (
       await SELF.fetch(`${BASE}/v1/contributors/alice`)
     ).json()) as any;
-    expect(all.counts.commits).toBe(1); // e2 is the merge's commit: deduped
+    expect(all.counts.commits).toBe(2); // e2, the merge's commit, is alice's
     expect(all.counts.prs).toBe(1);
     expect(all.counts.comments).toBe(1);
 
@@ -349,12 +384,13 @@ describe("/v1/contributors", () => {
         `${BASE}/v1/contributors/alice?from=2026-01-10&to=2026-01-12`,
       )
     ).json()) as any;
-    expect(windowed.counts.commits).toBe(0); // only e2 in the window, deduped
+    expect(windowed.counts.commits).toBe(1); // only e2 in the window
 
     const merges = (await (
       await SELF.fetch(`${BASE}/v1/contributors/erik?type=merge`)
     ).json()) as any;
-    expect(merges.counts.commits).toBe(1); // merges fold into commits
+    expect(merges.counts.merges).toBe(1);
+    expect(merges.counts.commits).toBe(0); // a merge is not a commit
 
     const commented = (await (
       await SELF.fetch(`${BASE}/v1/contributors/alice?type=comment_issue`)

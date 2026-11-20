@@ -115,17 +115,19 @@ export interface Counts {
   reviews: number;
   issues: number;
   comments: number;
+  merges: number;
 }
 
 function emptyCounts(): Counts {
-  return { commits: 0, prs: 0, reviews: 0, issues: 0, comments: 0 };
+  return { commits: 0, prs: 0, reviews: 0, issues: 0, comments: 0, merges: 0 };
 }
 
-// Merges fold into commits ("Top Commits" credits the merger; the merge
-// commit itself was excluded at rollup time). All comment surfaces fold into
-// one comments number; opening an issue is its own count.
+// Merges are their own count, as the merge commit is its author's commit on
+// the default branch (db/rollups.ts). All comment surfaces fold into one
+// comments number; opening an issue is its own count.
 export function addToCounts(counts: Counts, type: string, n: number): void {
-  if (type === "commit" || type === "merge") counts.commits += n;
+  if (type === "commit") counts.commits += n;
+  else if (type === "merge") counts.merges += n;
   else if (type === "pr") counts.prs += n;
   else if (type === "review") counts.reviews += n;
   else if (type === "issue") counts.issues += n;
@@ -139,6 +141,7 @@ interface WeeklyBucket {
   reviews: number;
   issues: number;
   comments: number;
+  merges: number;
 }
 
 export function weeklyFrom(
@@ -149,10 +152,19 @@ export function weeklyFrom(
     const week = isoWeek(r.day);
     let b = byWeek.get(week);
     if (!b) {
-      b = { week, commits: 0, prs: 0, reviews: 0, issues: 0, comments: 0 };
+      b = {
+        week,
+        commits: 0,
+        prs: 0,
+        reviews: 0,
+        issues: 0,
+        comments: 0,
+        merges: 0,
+      };
       byWeek.set(week, b);
     }
-    if (r.type === "commit" || r.type === "merge") b.commits += r.count;
+    if (r.type === "commit") b.commits += r.count;
+    else if (r.type === "merge") b.merges += r.count;
     else if (r.type === "pr") b.prs += r.count;
     else if (r.type === "review") b.reviews += r.count;
     else if (r.type === "issue") b.issues += r.count;
@@ -161,10 +173,11 @@ export function weeklyFrom(
   return [...byWeek.values()].sort((a, b) => (a.week < b.week ? -1 : 1));
 }
 
-// The v2 contract predates comment and issue tracking, so its activity
-// notions ignore both entirely; v3 counts everything.
+// The v2 contract predates comment, issue and merge tracking, so its
+// notions ignore all three; v3 orders by everything.
 const totalV2 = (c: Counts): number => c.commits + c.prs + c.reviews;
-const totalV3 = (c: Counts): number => totalV2(c) + c.issues + c.comments;
+const totalV3 = (c: Counts): number =>
+  totalV2(c) + c.issues + c.comments + c.merges;
 
 // Recent-feed labels collapse the three comment surfaces into one word.
 const recentType = (type: string): string =>
@@ -181,6 +194,7 @@ interface RepoSlice {
 interface StatsModel {
   totals: Counts;
   activeV2: number;
+  // Everyone with tracked activity, contributions or not.
   activeV3: number;
   contributors: ContributorRow[];
   perContributor: Map<number, { counts: Counts; rollups: RollupRow[] }>;
@@ -198,8 +212,10 @@ async function assembleModel(env: Env, url: URL): Promise<StatsModel> {
        FROM contributors c WHERE 1=1${botFilter(url)}
        ORDER BY c.login`,
       ),
+      // A bucket's tally is what its events count for (db/rollups.ts
+      // TALLIED); the bucket itself, tally or not, is activity.
       env.DB.prepare(
-        `SELECT r.repo, r.contributor_id, r.day, r.type, r.count
+        `SELECT r.repo, r.contributor_id, r.day, r.type, r.tally AS count
        FROM daily_rollups r JOIN contributors c ON c.id = r.contributor_id
        WHERE 1=1${botFilter(url)}`,
       ),
@@ -252,7 +268,9 @@ async function assembleModel(env: Env, url: URL): Promise<StatsModel> {
   for (const c of contributors) {
     perContributor.set(c.id, { counts: emptyCounts(), rollups: [] });
   }
+  const active = new Set<number>();
   for (const r of rollups) {
+    active.add(r.contributor_id);
     addToCounts(totals, r.type, r.count);
     const pc = perContributor.get(r.contributor_id);
     if (pc) {
@@ -292,14 +310,15 @@ async function assembleModel(env: Env, url: URL): Promise<StatsModel> {
       });
   }
 
-  // "Total contributors" = union of humans with >=1 qualifying event (or
-  // everyone with events under ?include_bots=1) — not the roster row count
-  // and not GitHub's commit-only number.
+  // "Total contributors" = union of humans with >=1 tracked event (or
+  // everyone with events under ?include_bots=1), whether or not any of it
+  // counts as a contribution yet — not the roster row count and not GitHub's
+  // commit-only number. v2 keeps its own notion over its three counts.
   const all = [...perContributor.values()];
   return {
     totals,
     activeV2: all.filter((pc) => totalV2(pc.counts) > 0).length,
-    activeV3: all.filter((pc) => totalV3(pc.counts) > 0).length,
+    activeV3: active.size,
     contributors,
     perContributor,
     perRepo,
@@ -337,6 +356,7 @@ function contributorObjs(
       if (opts.withComments) {
         counts["issues"] = pc.counts.issues;
         counts["comments"] = pc.counts.comments;
+        counts["merges"] = pc.counts.merges;
       }
       const obj: Record<string, unknown> = {
         login: c.login,
@@ -350,7 +370,7 @@ function contributorObjs(
         const weekly = weeklyFrom(pc.rollups);
         obj["weekly"] = opts.withComments
           ? weekly
-          : weekly.map(({ issues: _i, comments: _c, ...w }) => w);
+          : weekly.map(({ issues: _i, comments: _c, merges: _m, ...w }) => w);
       }
       return obj;
     })
@@ -358,11 +378,13 @@ function contributorObjs(
       const ta = total({
         issues: 0,
         comments: 0,
+        merges: 0,
         ...(a["counts"] as object),
       } as Counts);
       const tb = total({
         issues: 0,
         comments: 0,
+        merges: 0,
         ...(b["counts"] as object),
       } as Counts);
       return (
@@ -403,14 +425,23 @@ export function shapeV2(
           reviews: slice.counts.reviews,
         },
         weekly: weeklyFrom(slice.rollups).map(
-          ({ issues: _i, comments: _c, ...w }) => w,
+          ({ issues: _i, comments: _c, merges: _m, ...w }) => w,
         ),
       }))
       .sort(
         (a, b) =>
-          totalV2({ issues: 0, comments: 0, ...b.totals } as Counts) -
-            totalV2({ issues: 0, comments: 0, ...a.totals } as Counts) ||
-          (a.name < b.name ? -1 : 1),
+          totalV2({
+            issues: 0,
+            comments: 0,
+            merges: 0,
+            ...b.totals,
+          } as Counts) -
+            totalV2({
+              issues: 0,
+              comments: 0,
+              merges: 0,
+              ...a.totals,
+            } as Counts) || (a.name < b.name ? -1 : 1),
       ),
     contributors: contributorObjs(model, {
       withWeekly: opts.withWeekly,
@@ -419,7 +450,8 @@ export function shapeV2(
   };
 }
 
-// Schema 3, served on /v2/stats: comments and merges everywhere, per-repo
+// Schema 3, served on /v2/stats: comments and merges (each its own count)
+// everywhere, commits counted once on the default branch, per-repo
 // leaderboards for the jumbotron's per-repo boards, last_activity_at for its
 // seven-day display filter, and the recent-contributions feed.
 export function shapeV3(model: StatsModel): Record<string, unknown> {
@@ -432,6 +464,7 @@ export function shapeV3(model: StatsModel): Record<string, unknown> {
       reviews: leaderboardFor(model.contributors, countsOf, (c) => c.reviews),
       comments: leaderboardFor(model.contributors, countsOf, (c) => c.comments),
       issues: leaderboardFor(model.contributors, countsOf, (c) => c.issues),
+      merges: leaderboardFor(model.contributors, countsOf, (c) => c.merges),
     },
     repos: [...model.perRepo.entries()]
       .map(([name, slice]) => {
@@ -439,9 +472,7 @@ export function shapeV3(model: StatsModel): Record<string, unknown> {
         return {
           name,
           totals: {
-            contributors: [...slice.perContributor.values()].filter(
-              (c) => totalV3(c) > 0,
-            ).length,
+            contributors: slice.perContributor.size,
             ...slice.counts,
           },
           weekly: weeklyFrom(slice.rollups),
@@ -468,6 +499,11 @@ export function shapeV3(model: StatsModel): Record<string, unknown> {
               model.contributors,
               repoCountsOf,
               (c) => c.issues,
+            ),
+            merges: leaderboardFor(
+              model.contributors,
+              repoCountsOf,
+              (c) => c.merges,
             ),
           },
         };

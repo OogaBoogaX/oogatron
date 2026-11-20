@@ -109,10 +109,16 @@ describe("recomputeRollups", () => {
   it("rolls back flags and summaries together if final deletion fails, then retries", async () => {
     await seed();
     await recomputeRollups(env.DB);
-    await env.DB.prepare(
-      `INSERT INTO activity_events (contributor_id, type, external_id, occurred_at, payload)
-       VALUES (1, 'merge', 'new-merge', '2026-01-07T00:00:00Z', '{"mergeCommit":"e1"}')`,
-    ).run();
+    const patch = '{"authoredAt":"2026-01-04T00:00:00Z","headline":"a"}';
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE activity_events SET payload = ? WHERE external_id = 'e1'",
+      ).bind(patch),
+      env.DB.prepare(
+        `INSERT INTO activity_events (contributor_id, type, external_id, occurred_at, payload)
+         VALUES (1, 'commit', 'e1-rebased', '2026-01-07T00:00:00Z', ?)`,
+      ).bind(patch),
+    ]);
     await env.DB.prepare(
       "DELETE FROM activity_events WHERE external_id = 'e3'",
     ).run();
@@ -127,8 +133,8 @@ describe("recomputeRollups", () => {
       ).results,
     });
     const before = await snapshot();
-    // Fail the batch's last statement, after the merge has unflagged e1 and
-    // the triggers have moved its bucket.
+    // Fail the batch's last statement, after the rebased copy has unflagged
+    // e1 and the triggers have moved its bucket.
     await env.DB.prepare(
       `CREATE TRIGGER fail_dirty_delete BEFORE DELETE ON counted_dirty
        BEGIN SELECT RAISE(ABORT, 'injected summary failure'); END`,
@@ -158,40 +164,6 @@ describe("recomputeRollups", () => {
     );
   });
 
-  it("re-flags merge commits across rebuilds", async () => {
-    await env.DB.batch([
-      env.DB.prepare(
-        "INSERT INTO contributors (id, login, is_bot) VALUES (1, 'alice', 0), (2, 'erik', 0)",
-      ),
-      env.DB.prepare(
-        `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at) VALUES
-         ('entropylab', 1, 'commit', 'oid-1', '2026-01-10T10:00:00Z')`,
-      ),
-    ]);
-    const flag = () =>
-      env.DB.prepare(
-        "SELECT counted FROM activity_events WHERE external_id = 'oid-1'",
-      ).first<{ counted: number }>();
-
-    await recomputeRollups(env.DB);
-    expect((await flag())!.counted).toBe(1);
-
-    // The merge lands in a later run than its commit.
-    await env.DB.prepare(
-      `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload) VALUES
-       ('entropylab', 2, 'merge', 'merge:pr1', '2026-01-10T10:01:00Z', '{"prNumber":1,"mergeCommit":"oid-1"}')`,
-    ).run();
-    await recomputeRollups(env.DB);
-    expect((await flag())!.counted).toBe(0);
-
-    // The merge's oid is corrected away: the commit counts again.
-    await env.DB.prepare(
-      `UPDATE activity_events SET payload = '{"prNumber":1,"mergeCommit":"oid-9"}' WHERE external_id = 'merge:pr1'`,
-    ).run();
-    await recomputeRollups(env.DB);
-    expect((await flag())!.counted).toBe(1);
-  });
-
   it("aggregates per day/contributor/type and is safe to re-run", async () => {
     await seed();
     await recomputeRollups(env.DB);
@@ -216,7 +188,7 @@ describe("recomputeRollups", () => {
     expect(after!.count).toBe(3);
   });
 
-  it("excludes a merge's own commit in the same repo, keeps it elsewhere, tolerates null oids", async () => {
+  it("counts a merge's own commit as its author's, the merge as its own kind", async () => {
     await env.DB.batch([
       env.DB.prepare(
         "INSERT INTO contributors (id, login, is_bot) VALUES (1, 'alice', 0), (2, 'erik', 0)",
@@ -234,11 +206,11 @@ describe("recomputeRollups", () => {
     const rows = await env.DB.prepare(
       "SELECT repo, type, SUM(count) AS n FROM daily_rollups GROUP BY repo, type ORDER BY repo, type",
     ).all<{ repo: string; type: string; n: number }>();
+    // A merge commit on the default branch is its author's commit, as on
+    // GitHub's graph; whoever merged gets the merge.
     expect(rows.results).toEqual([
-      // bedrock's identical oid is untouched: the exclusion is repo-scoped.
       { repo: "bedrock", type: "commit", n: 1 },
-      // entropylab keeps oid-2 only; oid-1 folded into merge:pr1's credit.
-      { repo: "entropylab", type: "commit", n: 1 },
+      { repo: "entropylab", type: "commit", n: 2 },
       { repo: "entropylab", type: "merge", n: 2 },
     ]);
   });
@@ -250,10 +222,11 @@ describe("patch-identity dedupe", () => {
     committed: string,
     authored: string,
     headline: string,
+    landed: number | null = null,
   ) =>
     env.DB.prepare(
-      `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload)
-       VALUES ('entropylab', 1, 'commit', ?, ?, ?)`,
+      `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload, landed)
+       VALUES ('entropylab', 1, 'commit', ?, ?, ?, ?)`,
     ).bind(
       oid,
       committed,
@@ -263,6 +236,7 @@ describe("patch-identity dedupe", () => {
         deletions: 0,
         authoredAt: authored,
       }),
+      landed,
     );
   const counted = async () =>
     (
@@ -301,7 +275,7 @@ describe("patch-identity dedupe", () => {
     expect(await counted()).toEqual(["other-1", "rebased-1"]);
   });
 
-  it("squash: branch commits count, the squash commit folds into the merge", async () => {
+  it("squash: branch commits are activity, the squash commit is the contribution", async () => {
     await env.DB.batch([
       env.DB.prepare(
         "INSERT INTO contributors (id, login, is_bot) VALUES (1, 'alice', 0), (2, 'erik', 0)",
@@ -311,18 +285,21 @@ describe("patch-identity dedupe", () => {
         "2026-02-01T10:00:00Z",
         "2026-02-01T10:00:00Z",
         "feat: x",
+        0,
       ),
       commit(
         "branch-2",
         "2026-02-01T11:00:00Z",
         "2026-02-01T11:00:00Z",
         "fix: y",
+        0,
       ),
       commit(
         "squash-1",
         "2026-02-02T09:00:00Z",
         "2026-02-02T09:00:00Z",
         "feat: x (#9)",
+        1,
       ),
       env.DB.prepare(
         `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload)
@@ -330,7 +307,22 @@ describe("patch-identity dedupe", () => {
       ),
     ]);
     await recomputeRollups(env.DB);
-    expect(await counted()).toEqual(["branch-1", "branch-2"]);
+    expect(await counted()).toEqual(["branch-1", "branch-2", "squash-1"]);
+    const commits = await env.DB.prepare(
+      "SELECT SUM(count) AS count, SUM(tally) AS tally FROM daily_rollups WHERE type = 'commit'",
+    ).first();
+    expect(commits).toEqual({ count: 3, tally: 1 });
+
+    // A branch commit later found on the default branch counts from then on.
+    await env.DB.prepare(
+      "UPDATE activity_events SET landed = 1 WHERE external_id = 'branch-1'",
+    ).run();
+    expect(
+      await env.DB.prepare(
+        "SELECT SUM(tally) AS n FROM daily_rollups WHERE type = 'commit'",
+      ).first("n"),
+    ).toBe(2);
+    expect(await recomputeRollups(env.DB)).toBe(0);
   });
 });
 
@@ -346,9 +338,6 @@ describe("incremental rollups", () => {
     const reconcile = await plan(RECONCILE_FLAGS);
     expect(reconcile.join("\n")).not.toMatch(/SCAN (e|activity_events)\b/);
     expect(reconcile.join("\n")).toMatch(/idx_events_commit_identity/);
-    expect(reconcile.join("\n")).toMatch(
-      /idx_events_merge_commit \(repo=\? AND <expr>=\?\)/,
-    );
 
     // Every statement /v2/stats sends that reads events: the recent feed and
     // the two last-activity reads.
@@ -409,16 +398,23 @@ describe("incremental rollups", () => {
     });
 
     for (let step = 0; step < 300; step++) {
-      const op = rand(10);
+      const op = rand(11);
       const repo = pick(repos);
       const commits = live.filter((e) => e.type === "commit");
       if (op < 4 || live.length < 3) {
         const id = `c${next++}`;
         live.push({ repo, id, type: "commit" });
         await env.DB.prepare(
-          "INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload) VALUES (?, ?, 'commit', ?, ?, ?)",
+          "INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload, landed) VALUES (?, ?, 'commit', ?, ?, ?, ?)",
         )
-          .bind(repo, 1 + rand(2), id, at(), commitPayload())
+          .bind(
+            repo,
+            1 + rand(2),
+            id,
+            at(),
+            commitPayload(),
+            pick([null, 0, 1]),
+          )
           .run();
       } else if (op === 4) {
         const id = `m${next++}`;
@@ -469,6 +465,10 @@ describe("incremental rollups", () => {
           await env.DB.prepare("UPDATE activity_events SET payload = ?" + where)
             .bind(payload, e.repo, e.id)
             .run();
+        } else if (op === 9) {
+          await env.DB.prepare("UPDATE activity_events SET landed = ?" + where)
+            .bind(pick([null, 0, 1]), e.repo, e.id)
+            .run();
         } else {
           live.splice(live.indexOf(e), 1);
           await env.DB.prepare("DELETE FROM activity_events" + where)
@@ -493,6 +493,10 @@ describe("incremental rollups", () => {
       "SELECT COUNT(*) AS n FROM activity_events WHERE counted = 0",
     ).first<{ n: number }>();
     expect(uncounted!.n).toBeGreaterThan(0);
+    const unlanded = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM daily_rollups WHERE tally < count",
+    ).first<{ n: number }>();
+    expect(unlanded!.n).toBeGreaterThan(0);
   });
 });
 

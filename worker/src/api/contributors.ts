@@ -1,5 +1,5 @@
 import { botFilter } from "../db/queries";
-import { COUNTED } from "../db/rollups";
+import { TALLIED } from "../db/rollups";
 import { addToCounts, assembleStats, weeklyFrom, type Counts } from "./stats";
 import { error, json } from "./respond";
 
@@ -61,9 +61,9 @@ export async function handleContributor(
     return error(400, "from/to must be YYYY-MM-DD");
   }
 
-  // Same counted flag as the rollup recompute, so this raw-event
-  // path can never disagree with the served rollup numbers.
-  let sql = `SELECT type, occurred_at FROM activity_events e WHERE e.contributor_id = ? AND ${COUNTED}`;
+  // The same rule as the rollups' tally, so this raw-event path can never
+  // disagree with the served rollup numbers.
+  let sql = `SELECT type, occurred_at FROM activity_events e WHERE e.contributor_id = ? AND ${TALLIED}`;
   const params: unknown[] = [row.id];
   if (from) {
     sql += " AND occurred_at >= ?";
@@ -92,6 +92,7 @@ export async function handleContributor(
     reviews: 0,
     issues: 0,
     comments: 0,
+    merges: 0,
   };
   const dayCounts = new Map<string, Map<string, number>>();
   for (const e of events.results) {

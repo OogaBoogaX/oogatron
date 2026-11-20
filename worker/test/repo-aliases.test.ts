@@ -214,6 +214,14 @@ describe("Lightning Foundry repository identity", () => {
       },
     ]);
 
+    await cleanup();
+    expect(await snapshot()).toEqual(after);
+
+    // 0009 applied its day's counting rules. In production migration 0013
+    // follows it and rebuilds the flags and tallies under today's: the merge
+    // commit counts as its author's, the merge as its own kind.
+    expect(await recomputeRollups(env.DB)).toBeGreaterThan(0);
+    expect(await recomputeRollups(env.DB)).toBe(0);
     const response = await SELF.fetch("https://oogatron.test/v2/stats");
     expect(response.status).toBe(200);
     const stats = (await response.json()) as any;
@@ -224,6 +232,7 @@ describe("Lightning Foundry repository identity", () => {
       reviews: 1,
       issues: 0,
       comments: 0,
+      merges: 1,
     });
     expect(stats.repos.map((r: any) => r.name).sort()).toEqual([
       "bananapayserver",
@@ -238,20 +247,15 @@ describe("Lightning Foundry repository identity", () => {
       reviews: 1,
       issues: 0,
       comments: 0,
+      merges: 1,
     });
-    expect(stats.recent).toHaveLength(8);
+    expect(stats.recent).toHaveLength(9); // merge-sha among them now
     expect(
       stats.recent.every(
         (r: any) =>
           r.repo === "lightningfoundry" || r.repo === "bananapayserver",
       ),
     ).toBe(true);
-
-    await cleanup();
-    expect(await snapshot()).toEqual(after);
-    // Migration flags/rollups match the production rebuild exactly.
-    await recomputeRollups(env.DB);
-    expect(await snapshot()).toEqual(after);
   });
 
   it("blocks old-worker alias writes atomically while new persistence normalizes them", async () => {

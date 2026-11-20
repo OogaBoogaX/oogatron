@@ -228,17 +228,18 @@ describe("full sync against recorded GraphQL pages", () => {
     // Deleted PR author became ghost:
     expect(byLogin.get("ghost")).toBeDefined();
 
-    // Rollups were recomputed, repo-scoped, and the merge commit (...a3, the
-    // PR's mergeCommit) was excluded so the merge is one credit, not two:
-    // 15 raw events minus the excluded commit.
+    // Rollups were recomputed and repo-scoped. Every one of the 15 raw events
+    // is activity; the merge commit (...a3) is its author's commit and the
+    // merge its own kind. b1, on open PR #2's branch alone, is activity but
+    // not yet a contribution.
     const rollups = await env.DB.prepare(
       "SELECT SUM(count) AS n FROM daily_rollups WHERE repo = 'entropylab'",
     ).first<{ n: number }>();
-    expect(rollups!.n).toBe(14);
-    const dedupedCommit = await env.DB.prepare(
-      `SELECT SUM(count) AS n FROM daily_rollups WHERE type = 'commit'`,
-    ).first<{ n: number }>();
-    expect(dedupedCommit!.n).toBe(3); // a1 + a2 + b1; a3 folded into the merge
+    expect(rollups!.n).toBe(15);
+    const commits = await env.DB.prepare(
+      `SELECT SUM(count) AS count, SUM(tally) AS tally FROM daily_rollups WHERE type = 'commit'`,
+    ).first();
+    expect(commits).toEqual({ count: 4, tally: 3 }); // a1 + a2 + a3 landed
 
     // Sync state promoted to incremental, keyed per repo; the rotation
     // pointer recorded which repo led.
@@ -415,8 +416,58 @@ describe("parsePrNode branch commits", () => {
         reviewCursor: null,
         commentCursor: null,
         commitCursor: "commit-cursor-1",
+        landed: false,
       },
     ]);
+  });
+
+  it("lands a PR's branch commits only when it was merged with a merge commit", () => {
+    const landed = (pr: any) =>
+      parsePrNode(pr)
+        .events.filter((e) => e.type === "commit")
+        .map((e) => e.landed);
+    expect(landed(prs[0])).toEqual([true]);
+    const squashed = {
+      ...prs[0],
+      mergeCommit: { ...prs[0].mergeCommit, parents: { totalCount: 1 } },
+    };
+    expect(landed(squashed)).toEqual([false]);
+    expect(landed(prs[1])).toEqual([false]); // still open
+  });
+});
+
+describe("default-branch re-walk after migration 0013", () => {
+  it("settles commits it never reached as unlanded, and lands the rest", async () => {
+    orgReposResponse = orgRepos;
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO contributors (id, login, github_id, is_bot) VALUES (1, 'alice', 1001, 0)",
+      ),
+      env.DB.prepare(
+        `INSERT INTO activity_events (repo, contributor_id, type, external_id, occurred_at, payload, landed) VALUES
+         ('entropylab', 1, 'commit', 'cccccccccccccccccccccccccccccccccccccc01', '2025-12-01T00:00:00Z', '{}', NULL),
+         ('entropylab', 1, 'commit', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2', '2026-01-06T09:00:00Z', '{}', NULL)`,
+      ),
+    ]);
+    // Until the walk finishes, a commit from before the migration counts.
+    expect(
+      await env.DB.prepare(
+        "SELECT SUM(tally) AS n FROM daily_rollups WHERE type = 'commit'",
+      ).first("n"),
+    ).toBe(2);
+    await runSync(env, "admin");
+    const landed = await env.DB.prepare(
+      "SELECT external_id, landed FROM activity_events WHERE external_id IN ('cccccccccccccccccccccccccccccccccccccc01', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2') ORDER BY external_id",
+    ).all();
+    expect(landed.results).toEqual([
+      { external_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2", landed: 1 },
+      { external_id: "cccccccccccccccccccccccccccccccccccccc01", landed: 0 },
+    ]);
+    // Still activity, no longer a contribution.
+    const stale = await env.DB.prepare(
+      "SELECT count, tally FROM daily_rollups WHERE day = '2025-12-01' AND type = 'commit'",
+    ).first();
+    expect(stale).toEqual({ count: 1, tally: 0 });
   });
 });
 
@@ -610,7 +661,7 @@ describe("stale-run guard", () => {
       // An existing cleanup must remove this vanished bucket. Fail after
       // its replacement aggregate has been upserted to exercise rollback.
       env.DB.prepare(
-        "INSERT INTO daily_rollups VALUES ('entropylab', '2020-01-01', 1, 'pr', 1)",
+        "INSERT INTO daily_rollups VALUES ('entropylab', '2020-01-01', 1, 'pr', 1, 1)",
       ),
       env.DB.prepare(
         `CREATE TRIGGER fail_cleanup_delete BEFORE DELETE ON daily_rollups

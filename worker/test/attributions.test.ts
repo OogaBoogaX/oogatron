@@ -137,6 +137,9 @@ describe("confirmed contribution alias", () => {
         ).all()
       ).results,
     ).toHaveLength(0);
+    // This replays 0010 over today's schema; in production migration 0013
+    // follows it and rebuilds the rollups' tallies.
+    await recomputeRollups(env.DB);
     const stats = (await (
       await SELF.fetch("https://oogatron.test/v2/stats")
     ).json()) as any;

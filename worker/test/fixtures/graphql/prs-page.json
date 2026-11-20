@@ -32,7 +32,8 @@
               "databaseId": 4004
             },
             "mergeCommit": {
-              "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3"
+              "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3",
+              "parents": { "totalCount": 2 }
             },
             "reviews": {
               "pageInfo": {
